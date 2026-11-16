@@ -8,6 +8,7 @@
 0x004C8F00 the AVI player opens a file: the Zoom logo (data/video/nvidia.avi in that release) is not played (FO2_SKIP_LOGO)
 0x00524276 the Lua chunk reader, after a read: a car's camera.ini gets an extra camera appended (FO2_CAM4)
 0x0061AB73 FSOUND_3D_SetAttributes: a new sound takes its distance gain at once, not at the next FSOUND_Update (FO2_FMOD_STARTGAIN)
+0x0041A7F0 a car's engine sound update (eax = its state, [esp+4] = ms since the last one): bad time steps and non-finite state are repaired (FO2_ENGINE_GUARD)
 # Sound investigation: the FMOD entries the game's sound layer calls most (FO2_FMOD_TRACE=1 logs their arguments).
 # Uncomment to trace them (each costs a register sync per call and takes the function out of the x87 window).
 # 0x0061598D  0x00615B77  0x0061C325  0x00615830  0x006154FD  0x00616483  0x00615B31  0x0061BF24  0x0061AB73  0x006155A8

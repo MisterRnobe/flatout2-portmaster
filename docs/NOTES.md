@@ -418,6 +418,179 @@ GetAdaptersInfo and the ordinals #11 #12 #103 #108 #151. A session can be create
 thread g6 (0x4E58B0), sub_005070C0, reading [ebp+0x1128] with ebp = 0 (0x5076E7 or 0x507791), just after the packet handler 0x506160. The thread's argument, ebp's value, is still on the stack
 (0x6D9C18 at [esp+0x5C]), so a callee did not give it back. Whether a saved ebp was overwritten is not established: the capture does not reach that far below esp.
 
+**Render thread and GPU, second pass (2026-11-12, RG34XX-SP; not installed yet: test binary `fo2_test.aarch64` on the console).**
+Method: automatic race with FO2_AUTORESET=8, "heavy zone" = PERF blocks with at least 350 draws (the pack at the start). Races differ
+a lot (412 to 541 draws on average in that zone), so only repeated A/B pairs count. Before: 37.9 / 39.6 FPS in the heavy zone, 43-44
+over the race. After everything below: 50.2 to 54.3 in the heavy zone, 53 to 56 over the race.
+- `FO2_RT_PROF=1` (d3d9_render_thread.inc) prints the wall time of the render thread's queued commands by kind (op/method, per
+  frame, with the calls over 0.3 ms). It showed the thread blocked in the driver: SetRenderTarget (method 37) 3 to 8 ms a frame for
+  22 calls, buffer updates (op 7) 3.6 to 4.4 ms, Clear (method 43) up to 4 ms.
+- **One framebuffer object per target** (bindRenderTarget, m_fboCache; FO2_FBO_CACHE=0: the single re-attached object). The Mali
+  flushes, and can wait for, the pending rendering of an object whose attachments change. SetRenderTarget: 1.5 ms a frame. The cache
+  is dropped whenever a texture or renderbuffer is deleted (glsc::attachmentGeneration).
+- **Tiler hints** (FO2_TILER_HINTS=0 off): a Clear of the whole target goes without the scissor test; Present invalidates the back
+  buffer's depth and stencil; the buffer the next frame starts in is cleared whole (colour only in a race: menus and loading screens
+  redraw parts of the picture). The game itself clears only depth (flags=2) on the back buffer, so the GPU loaded the old picture
+  back every frame. That last clear gave black frames in races with two presenter buffers (user report; 7 of 90 framebuffer captures,
+  none with the hints off): the buffer was cleared right after its presentation, before the presenter context's copy to the screen
+  had run. Now three buffers (NFSU2_PRESENT_SLOTS, default 3) and a buffer is released one presentation later (presenter::heldSlot),
+  at once when nothing else is queued; with two buffers that clear is not done. 270 captures in three races: no black frame.
+- **Lazy storage for large dynamic buffers** (GlesBufferUse::lazy, FO2_LAZY_BUFFERS=0 off; dynamic, 64 KB or more): an orphaned
+  buffer gets empty storage instead of the whole CPU copy (a 1 MB ring, twice a frame), updates only mark 1 KB pages invalid, and each
+  draw uploads the pages it reads that the storage lacks (unsynchronized map). Indexed draws from such a buffer take their vertex
+  range from the indices themselves (noteBufferReads), not from the game's MinVertexIndex / NumVertices. Buffer updates: 0.6 to 0.9 ms.
+- **No `discard` when the alpha test is off** (PS variant key bit 20, kAlphaTestBit; FO2_NO_DISCARD=0 off). Every pixel shader ended
+  with the alpha test block, which keeps a tile-based GPU from writing depth early and killing hidden pixels. Two A/B pairs: heavy
+  zone 50.3 / 52.2 FPS without it, 41.2 / 40.4 with it; GPU wait 16-18 ms against 19-24. The GPU is fill-bound: at 480x320 it falls
+  under the refresh period in the heavy zone.
+- **Dead targets** (m_deadTargets, FO2_DEAD_TARGETS=0 off): the bloom chain still runs with the bloom off (two 512x432 passes, a
+  256x256 ping-pong of 5 to 7 passes, composites); its programs do not link, so its draws are dropped, but its 5 clears a frame were
+  render passes. A Clear is skipped on an off-screen target whose last draw had no program. Clear: 0.4 ms a frame.
+- No gain, left alone: the cars' shadows (8 targets of 256x256, one per car; FO2_SHADOW_EVERY=100000: 49.5 FPS against 53.1, within
+  the noise). `FO2_EXP_NODRAW=1/2` (diagnostics) skips the GL draw call or the whole draw.
+- The "presenter waited for the GPU" figure has a floor of 13-14 ms at 60 FPS even in menus with 11 draws: it includes the wait for
+  the panel's refresh, so it only means GPU time above that.
+- **Command ring prefetch** (rt::push and rt::loop): the 5 MB ring is far larger than the caches, so each slot was a miss; the
+  slots four calls ahead are now prefetched, for writing on the game thread and reading on the render thread. Ptrace sampler,
+  2,500 samples each in the heavy zone: push 6.3% -> 1.6% of the game thread, loop 2.3% -> 1.3% of the render thread.
+- Game thread profile in the heavy zone (same sampler): the game's render layer (0x58-0x5C) 18%, game logic 19%, engine
+  (0x52-0x56) 12%, physics 8.5%, d3dx9 effects 6%, the bridge about 14% before the prefetch, waiting 9%. No hot function (the
+  hottest lifted one is under 2%). The trigonometry seen in gdb stacks was noise (libm and compiler_rt: 0.5% in all).
+- Installed on the RG34XX-SP on 2026-11-12 (MD5 bf1b19939839c2ddb533c991b0a15b07); v1.0.0 kept beside it as fo2.aarch64.v100.
+  Last automatic races: 52.4 and 56.5 FPS in the heavy zone, 51 to 56 over the race.
+- Where it stands in the heavy zone: game thread 17-21 ms of CPU (now the limit), render thread 15-18 ms (9-11 ms in ~450
+  DrawIndexedPrimitive, of which ~15 us a draw inside the driver), GPU about 16 ms. The PERF line's "game-thread CPU" is really the
+  presenting (render) thread's. Never attach gdb in a race
+  (it froze the game for 15 s): use the ptrace sampler. Sparks to compare by eye against the installed binary (FO2_LAZY_BUFFERS=0 to rule the buffers out).
+
+**Game thread: what does not help (2026-11-13, RG34XX-SP).** The game thread is the limit in the heavy zone (16-17 ms of CPU for a
+16.7 ms budget; wall 18.6 to 20.7 ms). Races differ by about 8% in game-thread time for the same binary (15.7 to 17.4 ms), so only
+gains of 10% or more can be measured (`sum2.sh` in the session scratchpad: CPU of both threads per 100 draws). Tried, no measurable gain:
+- State blocks: the game captures and applies one about 400 times a frame (D3DX effects). FO2_EXP_NOBLOCK=1 (diagnostics, render
+  thread only, wrong picture possible) drops them all: both threads stay at 17 ms for ~540 draws.
+- Hot functions packed together: the code a race runs is 819 functions, 2.05 MB of 62.9 MB (ptrace sampler, 44,000 samples of
+  both threads). `build_guest.ps1 -ExtraFlags -ffunction-sections` and `build_host.ps1 -OrderFile <linker script>` (zig refuses
+  --symbol-ordering-file; a script with `SECTIONS { .text.fo2hot : { *(.text.<function>) ... } } INSERT BEFORE .text;` works) bring
+  them from 845 to 535 pages of 4 KB. Two A/B pairs: 16.3 / 17.4 ms without, 17.3 / 15.7 with. Not kept.
+- -O3: zig cc gives the same binary as -O2 (same MD5).
+- Huge pages: the Knulli kernel (4.9.170) has neither transparent huge pages nor hugetlbfs.
+- Calling convention (each lifted call writes and reloads 11 registers and the flags): a build with -DNFS_COUNT_CALLS counts
+  18,000 to 25,500 lifted calls a frame in a race, about 0.6 ms at most.
+- Trigonometry: 0.5% of the samples.
+Left with the size needed: profile-guided optimisation of the lifted code (zig ships neither the profile runtime nor
+llvm-profdata: it needs an LLVM download), and, for the GPU (about 16 ms in the heavy zone, fill-bound), a render scale applied in
+the bridge when frames run late. The installed binary is still the one of 2026-11-12 (bf1b1993...).
+
+**Music stutter and a crash without a sound device (GitHub issue 1, R50S, ArkOS4Clone, 2026-11-15).** The user plays with the
+music at 0%, and so did every test until now: nobody had listened to the music. FMOD mixes everything (music and sounds) into one
+looping DirectSound buffer of 16,384 bytes (93 ms); its mixer thread (entry 0x61DB85) and its stream thread (0x617A65) are guest
+threads, so they only run when the game thread lets the guest machine go. When they are late the output played the ring's old
+contents again ("stream stretches replayed"). RG34XX-SP, music at 80% (`MUSIC=80` in the session's raceopt.sh sets both volumes
+for a run and puts the user's file back): 6,633 of 45,094 granules replayed before the race (menus and above all the loading
+screen), none in the race.
+- **Queue between FMOD and the output** (PcmVoice::fifo, audio_mixer.h; FO2_AUDIO_FIFO=0 off, FO2_AUDIO_DELAY_MS start depth,
+  default 20): the blocks the guest publishes while the ring plays are queued and played in order; a dry queue gives silence, not
+  old sound, then waits for the target depth, which grows to the length of the dry spell (spells up to 150 ms; longer ones are
+  loading screens). Each 30 s without a dry spell, if more than the start depth plus 10 ms was always left, the queue is played 1%
+  faster down to that. Result: no replay at all; in a race no dry spell even with every frame 60 ms longer
+  (NFSU2_SLOW_RACE_MS=60), queue back at 44-48 ms; before the race 38-46 dry spells remain (loading): silence instead of repeats.
+- **Silent output when the device cannot be opened** (startSoundStream): the attached log shows "ALSA: Couldn't open audio device",
+  DirectSoundCreate failing, then a segmentation fault. SDL's dummy driver now takes over (the cursors keep moving) and the log
+  says "NO SOUND". Tested with AUDIODEV=hw:7,0: the race runs.
+- **The real fix is to run FMOD's two threads in parallel**: `NFSU2_PARALLEL_THREADS=61db85,617a65` (the runtime's NFSU2
+  mechanism, compiled in since v1.0.0, default list empty for this game). Replayed before the race: 45 of 41,083. But one start in
+  about thirty ended with "Guest thread 3: Unbalanced LeaveCriticalSection" (LeaveCriticalSection now logs the section, count and
+  owner). Not the default until that is understood; usable from fo2.env. Suspects: InitializeCriticalSection replacing the mutex
+  of a section another thread is entering; the deadlock resolver in enterCritical reading another thread's wait/handle pair.
+- Yielding the machine while holding a guest critical section (FO2_YIELD_WITH_LOCKS=1, test switch) changes nothing: 6,419 of 45,063.
+
+**Profile-guided optimisation of the lifted code (2026-11-15, kept; installed on the RG34XX-SP, MD5 e608d870...).** zig 0.17 is
+clang 22.1.8 and takes `-fprofile-generate` / `-fprofile-use`, but ships neither the profile runtime nor llvm-profdata. Both are in
+`work/pgo/` (not in the repository): `tools/llvm-profdata.exe` taken out of LLVM-22.1.8-win64.exe with 7-Zip, `profile-rt/` =
+compiler-rt/lib/profile and include/profile at tag llvmorg-22.1.8. Steps:
+1. Runtime: each InstrProfiling*.c except the Darwin / AIX / Fuchsia / Windows / Other platform files, plus InstrProfilingRuntime.cpp, with
+   `zig cc -target aarch64-linux-gnu.2.28 -O2 -fno-pie -I<parent of profile-rt as "profile"> -DCOMPILER_RT_HAS_ATOMICS=1
+   -DCOMPILER_RT_HAS_FCNTL_LCK=1 -DCOMPILER_RT_HAS_UNAME=1`; put the objects in the instrumented guest object folder (build_host links every .o there).
+2. `build_guest.ps1 -Out work\guest-obj-pgogen -ExtraFlags '-fprofile-generate','-mllvm','-enable-name-compression=false'` (the Windows
+   llvm-profdata has no zlib: compressed names cannot be merged), then build_host.ps1 with that folder.
+3. On the console: `LLVM_PROFILE_FILE=/tmp/fo2.profraw FO2_PROF_DUMP_SEC=170` (d3d9_gles.cpp writes the counters that many seconds
+   after the first frame, since test runs end with SIGKILL). The instrumented game is only about 10% slower.
+4. `llvm-profdata merge -o fo2.profdata fo2.profraw`, then `build_guest.ps1 -Out work\guest-obj-pgo -ExtraFlags
+   "-fprofile-use=<fo2.profdata>",'-Wno-profile-instr-out-of-date','-Wno-profile-instr-unprofiled'` and build_host.ps1.
+The profile used (`work/pgo/fo2-rg34xxsp-autorace.profdata`: boot, menus, loading and one automatic race, 21,354 functions) must be
+taken again after any new lift. Result, automatic races in turn with the build without it: game thread 14.88, 14.48, 13.45, 13.75,
+13.60, 13.75 ms (mean 13.99, 395 draws) against 14.93, 16.59, 17.54, 14.84, 15.62 (mean 15.90, 427 draws), about 6 to 9% at equal
+load; race 55.8 FPS on average against 53.5. The installed binary is built from work/guest-obj-pgo.
+
+**GKD Pixel II with the 2026-11-15 build (PGO, render-thread and GPU changes, audio queue), 2026-11-16.** Installed (MD5 e608d870...,
+v1.0.0 kept as fo2.aarch64.v100). Automatic races through the launcher, 150 s, PERF blocks with 200 draws or more (session scripts
+gkd.ps1 / gkdsum.sh): v1.0.0 at the launcher's 30 FPS cap 26.5 FPS (game thread 28.8 ms, render thread 24.2), with FO2_CAP=60
+30.8 FPS (slowest block 54.8 ms); new build 28.3 FPS at the cap (game 23.6 ms, render 18.5) and 40.0 FPS with FO2_CAP=60 (slowest
+block 35.2 ms, game 20.9, render 18.8). Audio: 3,599 and 1,952 of 53,070 granules replayed with v1.0.0, none with the queue (6 to 8
+dry spells in 80 s, loading included). Picture not captured there (no grim on ROCKNIX): `touch /tmp/fo2_shot` now saves the next
+frame as screenshot_N.ppm (in the source, not yet in the installed binary); the user checks it by eye.
+
+**Shader hitches after the no-discard variants (user report on the GKD Pixel II, 2026-11-16).** The user felt "bigger drops" in
+destruction. Their log: frames of 0.13 to 0.89 s in a race with `compile 1/765.4 ms` or `link 1/108.7 ms`, and 16 s at the race
+start with `link 22/15444.5 ms`. Two faults of the program cache, on every console:
+- A program in the binary cache still had both its shaders compiled at every run, at their first use. Now shaders of the game's
+  draws are only created with their source (compileGLShader's `lazy`, FO2_LAZY_SHADERS=0 off) and compiled when a program really has to be
+  linked (ensureShaderCompiled in getProgram). RG34XX-SP, compiles inside hitches: 19 with the build before, 8 at the first run, 0 after.
+- Programs that cannot link (the bloom chain) were linked again at every run. An empty `<key>.fail` file now remembers them
+  (ProgramBinaryCache::knownFailure / saveFailure; not used with FO2_FIX_VARYINGS=1). RG34XX-SP: 7 remembered, then 7 skipped.
+The new pixel shader variants themselves are compiled and linked once per console, then come from the cache: the first race after
+an update still stutters. Installed on the RG34XX-SP (MD5 9acebea6..., PGO guest objects). The GKD still has e608d870...: it dropped
+off the network during the copy of this build (fo2.new may be left there, partial).
+Also from that log: 301 dry spells of the audio queue in 282 two-second reports, in menus and races: on the RK3326 the queue turns
+constant lateness into constant short silences, so the queue is not enough there. Next: FMOD's threads in parallel
+(NFSU2_PARALLEL_THREADS=61db85,617a65) on that console, and the cause of its rare "Unbalanced LeaveCriticalSection".
+
+**FMOD's threads in parallel by default (2026-11-16).** NFS_SOUND_THREAD_ENTRY is now "61db85,617a65" (mixer and stream threads;
+`NFSU2_PARALLEL_THREADS=` empty puts them back under the machine). GKD Pixel II, music at 80%, 30 FPS cap, one automatic race each:
+under the machine 104 dry spells of the audio queue, 60 frames over 50 ms in the race, 26.8 FPS, slowest block 51.6 ms; in parallel 2
+dry spells, 1 frame over 50 ms, 29.9 FPS, slowest block 34.1 ms. The stream thread (Ogg decoding) was taking the machine from the
+game thread: the "machine 74.5" hitches of the R50S report. RG34XX-SP with music: 1 dry spell in a session against 39.
+The rare start-up error ("Unbalanced LeaveCriticalSection" in thread 3): 1 in 78 starts, then 1 in 150 after initCritical and
+deleteCritical were made safe against a thread that has taken the mutex but not yet written its count (both now decide with the
+mutex; a section initialised again keeps its mutex). The one capture: section 105e55b0 (a heap object), count 0, owner 0, lock
+count -1, no re-initialisation or deletion logged. Cause not found. LeaveCriticalSection on a section nobody holds is now ignored,
+as on Windows, and logged with the last operations on that section (csNote / csDump: E entered, L left, R / S the deadlock
+resolver, I, D, U). Installed on the RG34XX-SP (MD5 9192018b...). The GKD still has 9acebea6... (threads under the machine): it was
+off the network when this build was ready. To send a build there: gzip it (30 MB instead of 95) and `scp -l 6000`.
+
+**Second RG351P (dArkOS, Debian 13, 2026-11-16; the first one no longer powers on).** The user copied the old
+"RG351P - pret a jouer" folder there (CD archives with the GOG / Zoom exe, a build from before v1.0.0, kept as fo2.aarch64.old; old
+launcher kept as flatout2/launcher.old). Installed: build 9192018b... and the current launcher. Automatic races, music at 80%, 170 s
+(session scripts r351.ps1 / run351.sh / consum.sh): old build at the 30 FPS cap 26.3 FPS, 65 frames over 50 ms in the race (its
+shader cache was being filled), 17,111 of 108,748 audio granules replayed; new build 28.8 FPS, 4 frames over 50 ms, nothing
+replayed, 2 dry spells; with FO2_CAP=60 37.9 FPS, slowest block 34.5 ms. Picture and sound to be judged by the user.
+
+**The player's car silent, its jet flames missing (about one race in three for the user): found and fixed, 2026-11-16.**
+Not reproduced by 41 automatic races (career, single race, camera changes): the engine loops were always audible. The user's test:
+Single Race, Canal, Water Canal 1, car "Rocket" (two presses to the left in the car list); the flames show at once whether it is a
+good start. `FO2_AUTOPRESS` takes a list, one press every 4 s: six `a`, `dpright`, then `a` reaches a single race on Timberlands 1.
+In a bad race (FO2_FMOD_WATCH=1 in fo2.env, [FMODLOOP] lines): the player's seven engine loops (the channels at distance 8.0 from
+the listener) are playing, all at volume 0; in a good one a band is audible (153 at idle). gdb on the running game (stopped, not
+racing): the volumes come from 0x423D70 -> 0x419F60 -> 0x41A7F0, called once per car about every 50 to 110 ms with eax = the
+car's engine sound state and [esp+4] = the milliseconds since the last update. That function smooths the engine speed (+0x64,
+towards +0x24, clamped to +0x34..+0x38), the load (+0x68, towards +0x28, clamped to 0..1) and a start-up wobble (+0xA0, +0xA4); a
+NaN passes every clamp (unordered compares) and stays for the race. The guard in recomp_hook (fo2EngineSoundGuard,
+config/hooks.txt 0x41A7F0, FO2_ENGINE_GUARD=0 off, 2 log only) puts non-finite values in +0x60..+0xC0 back to rest and replaces a
+time step that is not positive by 1 ms. The user's ten starts after it: ten good (sound and flames). The log of that session shows
+it at work on most cars: "+68 = -nan" and "+b8 = -nan" with time steps of 100 to 110 ms, once "load -1.70141e+38": the load the
+function is given is not initialised yet at the first updates of a race (the cause upstream, in the caller, was not looked for).
+The flames come back with it, so they follow this state. Tools: scratchpad `nanscan` (a process's guest memory through /proc/pid/mem,
+no stop: default NaNs by address, or a dump of words), `carch2.sh` / `camtl.sh` (loops per channel, per second). The hook was added
+by hand to work/gen/recomp_0001.c as the lifter would (`RECOMP_HOOK(0x0041A7F0u);` after the entry label); only that file was
+compiled again (guest-obj and guest-obj-pgo). Installed on the RG34XX-SP: MD5 4cbb1e7d...
+
+**State before the user's v1.1.0 measurements (2026-11-16).** Build 4cbb1e7d... (PGO guest objects, engine sound guard) is on the
+three consoles: RG34XX-SP, GKD Pixel II, second RG351P. Control races with music at the old
+30 FPS cap: GKD 30.0 FPS, 2 frames over 50 ms, 1 dry spell; RG351P 29.1 FPS, 3 frames over 50 ms, none. One launcher from now on:
+`port/FlatOut 2.sh` defaults to 60 FPS on every console (FO2_CAP=30 in fo2.env for a steady 30; a copy named "... 30 FPS" still
+caps at 30), pushed to the three consoles (previous one kept as flatout2/launcher.prev). The release package, README and BUILD.md
+are still those of v1.0.0 (two launchers, no PGO step, old numbers).
+
 **The d3dx9_30.dll filter.** Lifting all 17,876 catalogued functions gave 5 GB of C: four sources Clang
 refused ("ran out of source locations"), nine with branches to missing labels. Most of it is data decoded as
 code: Microsoft merges `.rdata` into `.text`, and the HLSL compiler's string tables ("texCUBE", "tex3Dproj"...)

@@ -5,12 +5,15 @@
 // substitute textures. See HANDOVER_FOR_OPENCODE.md section 6 for the history behind this rule.
 
 #include "d3d9_gles_device.h"
+bool fo2InRace();   // guest_runtime.cpp: FlatOut 2 is in a race
+extern "C" { unsigned long long g_nfs_call_count = 0; }   // lifted calls (guest objects built with -DNFS_COUNT_CALLS)
 #include "vkbd.h"
 #include "vkbd_font.h"
 
 bool guestDrivingControls();  // guest_runtime.cpp: the game is reading driving controls
 
-extern "C" void __gcov_dump(void) __attribute__((weak));  // libgcov, only in -fprofile-generate builds
+extern "C" void __gcov_dump(void) __attribute__((weak));
+extern "C" int __llvm_profile_write_file(void) __attribute__((weak));  // clang profile runtime, only in -fprofile-generate builds  // libgcov, only in -fprofile-generate builds
 extern "C" bool nfsParallelGuest();  // guest_runtime.cpp: guest threads run in parallel
 
 #include <algorithm>
@@ -616,6 +619,8 @@ void perfThreadsReport(uint32_t frames, double wallMsPerFrame, double drawMsPerF
             std::printf("[NFSU2 PERF] buffer updates %.0f/frame (%.0f dynamic, %.1f orphaned), %.1f KB/frame written into buffers totalling %.1f MB/frame\n",
                         double(u - lu) / frames, double(d - ld) / frames, double(o - lo) / frames, double(b - lb) / frames / 1024.0, double(w - lw) / frames / 1048576.0);
         lu = u; lb = b; lw = w; ld = d; lo = o;
+        { static unsigned long long lastCalls = 0; const unsigned long long c = g_nfs_call_count; if (c) std::printf("[NFSU2 PERF] lifted calls %.0f/frame\n", double(c - lastCalls) / frames); lastCalls = c; }
+        { static uint64_t lastLazy = 0; const uint64_t lz = glesLazyBytes(); std::printf("[NFSU2 PERF] lazy buffer uploads %.1f KB/frame\n", (lz - lastLazy) / 1024.0 / frames); lastLazy = lz; }
         const uint64_t* ps = glesParticleStats();
         static uint64_t lp[4] = {};
         if (lastMaj >= 0)
@@ -1081,7 +1086,7 @@ typedef void (*PfnDeleteSync)(void*);
 
 struct State {
     bool tried = false, on = false;
-    int nSlots = 2, cur = 0;
+    int nSlots = 2, cur = 0, heldSlot = -1;
     Slot slots[kMaxSlots];
     SDL_Window* window = nullptr;
     SDL_Window* hidden = nullptr;   // test mode only (NFSU2_PRESENT_HIDDEN=1): where the render context sits instead of EGL surfaceless
@@ -1154,8 +1159,17 @@ static void threadMain() {
         SDL_GL_SwapWindow(S.window);
         const auto t2 = clk::now();
         {
+            // With three buffers a buffer is released one presentation later (at once when nothing else is queued): the
+            // render thread clears a buffer whole when it takes it (Present), and on the Mali that clear could overtake
+            // this context's pending copy of the same buffer to the screen: black frames in races.
             std::lock_guard<std::mutex> l(S.m);
-            S.slots[it.slot].busy = false;
+            if (S.nSlots >= 3) {
+                if (S.heldSlot >= 0) S.slots[S.heldSlot].busy = false;
+                S.heldSlot = it.slot;
+                if (S.items.empty()) { S.slots[it.slot].busy = false; S.heldSlot = -1; }
+            } else {
+                S.slots[it.slot].busy = false;
+            }
         }
         S.cvFree.notify_all();
         S.gpuWaitNs += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
@@ -1212,7 +1226,7 @@ bool init(SDL_Window* window, SDL_GLContext ctx1, int swapEffect) {
         if (f) { S.clientWait(f, 1, 1000000000ull); S.deleteSync(f); }
         if (!ok) return fail("glFenceSync does not work on this context");
     }
-    int n = 2;
+    int n = 3;
     if (const char* e = std::getenv("NFSU2_PRESENT_SLOTS")) n = std::atoi(e);
     S.nSlots = n < 2 ? 2 : (n > kMaxSlots ? kMaxSlots : n);
     S.window = window;
@@ -1551,6 +1565,7 @@ void IDirect3DDevice9GLES::resetStateDefaults() {
 
 IDirect3DDevice9GLES::~IDirect3DDevice9GLES() {
     if (m_fbo) glDeleteFramebuffers(1, &m_fbo);
+    for (auto& e : m_fboCache) glDeleteFramebuffers(1, &e.second);
     if (m_dummy2D) glDeleteTextures(1, &m_dummy2D);
     if (m_dummyCube) glDeleteTextures(1, &m_dummyCube);
     destroyBackBufferTarget();
@@ -1972,6 +1987,13 @@ extern "C" uint32_t glesGetD3D9PresentCount() {
 }
 #endif
 
+// FO2_TILER_HINTS (default 1): what a tile-based GPU needs to know to skip loading and storing whole buffers. See Clear and Present.
+static bool tilerHints() { static const bool v = [] { const char* e = std::getenv("FO2_TILER_HINTS"); return !(e && e[0] == '0'); }(); return v; }
+typedef void (*InvalidateFramebufferFn)(GLenum, GLsizei, const GLenum*);
+static InvalidateFramebufferFn invalidateFramebufferFn() {
+    static const InvalidateFramebufferFn fn = reinterpret_cast<InvalidateFramebufferFn>(SDL_GL_GetProcAddress("glInvalidateFramebuffer"));
+    return fn;
+}
 STDMETHODIMP IDirect3DDevice9GLES::Present(const RECT* pSourceRect, const RECT* pDestRect, HWND hDestWindowOverride, const RGNDATA* pDirtyRegion) {
 #ifdef __ANDROID__
     if (!g_hostWindow) return D3D_OK;
@@ -1979,6 +2001,8 @@ STDMETHODIMP IDirect3DDevice9GLES::Present(const RECT* pSourceRect, const RECT* 
     if (!m_sdlWindow) return D3D_OK;
 #endif
     const uint32_t frame = ++g_d3d9PresentCount;
+    // Tests on consoles without a framebuffer to read (Wayland): creating /tmp/fo2_shot saves the next frame shown, like L1 + R2
+    if (frame % 30 == 0 && access("/tmp/fo2_shot", F_OK) == 0) { unlink("/tmp/fo2_shot"); g_screenshotRequest = true; }
     if (frame % 30 == 0 && access("/tmp/as2_trace", F_OK) == 0) {
         unlink("/tmp/as2_trace");
         g_traceFrameOverride = static_cast<int>(frame);   // draws of the next frame see frame as the count
@@ -2018,6 +2042,18 @@ STDMETHODIMP IDirect3DDevice9GLES::Present(const RECT* pSourceRect, const RECT* 
     }
     // Profile-guided builds: NFSU2_GCOV_DUMP_FRAME=n writes the instrumented guest code's counters at
     // frame n (the smoke test ends with SIGKILL, so the normal at-exit dump never runs).
+    // clang -fprofile-generate builds: FO2_PROF_DUMP_SEC=n writes the counters (LLVM_PROFILE_FILE) n seconds after the first
+    // frame, since test runs end with SIGKILL. See scripts/build_guest.ps1 -ExtraFlags and docs/NOTES.md.
+    if (__llvm_profile_write_file) {
+        static const int dumpSec = [] { const char* e = std::getenv("FO2_PROF_DUMP_SEC"); return e ? std::atoi(e) : -1; }();
+        static const auto t0 = std::chrono::steady_clock::now();
+        static bool dumped = false;
+        if (dumpSec > 0 && !dumped && std::chrono::steady_clock::now() - t0 > std::chrono::seconds(dumpSec)) {
+            dumped = true;
+            const int rc = __llvm_profile_write_file();
+            std::printf("[FO2] profile counters written (%d) at frame %u\n", rc, frame);
+        }
+    }
     if (__gcov_dump) {
         static const int dumpFrame = [] { const char* e = std::getenv("NFSU2_GCOV_DUMP_FRAME"); return e ? std::atoi(e) : -1; }();
         if (static_cast<int>(frame) == dumpFrame) { __gcov_dump(); std::printf("[NFSU2] guest profile counters written\n"); }
@@ -2047,7 +2083,7 @@ STDMETHODIMP IDirect3DDevice9GLES::Present(const RECT* pSourceRect, const RECT* 
                         " %.2f ms/frame of CPU inside the GL driver (presenting thread)\n", frame,
                         cpuAcc / 120.0, wallAcc / 120.0, 120000.0 / wallAcc, drawAcc / 120.0, glsc::driverNs() / 1e6 / 120.0);
             { auto& pc = d3d9_gles::programBinaryCache();
-              if (pc.ok) std::printf("[NFSU2 PERF] program binary cache: %u loaded, %u saved, %u rejected\n", pc.loaded, pc.saved, pc.rejected); }
+              if (pc.ok) std::printf("[NFSU2 PERF] program binary cache: %u loaded, %u saved, %u rejected; failed links: %u skipped, %u remembered\n", pc.loaded, pc.saved, pc.rejected, pc.failuresSkipped, pc.failuresSaved); }
             perfThreadsReport(120, wallAcc / 120.0, glsc::driverNs() / 1e6 / 120.0, drawAcc / 120.0);
             gpuLoadReport(120, wallAcc / 120.0);
             {
@@ -2201,10 +2237,31 @@ STDMETHODIMP IDirect3DDevice9GLES::Present(const RECT* pSourceRect, const RECT* 
 #ifndef __ANDROID__
     if (m_bbFbo && presenter::active()) {
         const auto s0 = std::chrono::steady_clock::now();
+        // The frame's depth and stencil are not needed once it is drawn: without this the GPU writes them out to memory.
+        if (tilerHints() && !m_keepFbo && invalidateFramebufferFn()) {
+            glBindFramebuffer(GL_FRAMEBUFFER, m_bbFbo);
+            static const GLenum ds[2] = {GL_DEPTH_ATTACHMENT, GL_STENCIL_ATTACHMENT};
+            invalidateFramebufferFn()(GL_FRAMEBUFFER, 2, ds);
+        }
         presenter::submit(static_cast<float>(m_defaultBackBuffer->getWidth()), static_cast<float>(m_defaultBackBuffer->getHeight()), m_screenW, m_screenH, frame);
         if (!m_keepFbo) {
             m_bbFbo = presenter::currentFbo();
             m_bbTex = presenter::currentTex();
+            // The next frame starts in another buffer, holding an older frame: cleared whole, so that the GPU does not
+            // load that picture back before drawing over it (the game itself clears only what it needs).
+            if (tilerHints() && presenter::slotCount() >= 3) {
+                glBindFramebuffer(GL_FRAMEBUFFER, m_bbFbo);
+                glDisable(GL_SCISSOR_TEST);
+                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+                glDepthMask(GL_TRUE);
+                glStencilMask(0xFF);
+                glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+                glClearDepthf(1.0f);
+                glClearStencil(0);
+                // Colour only in a race, where the scene covers the screen: menus and loading screens redraw parts of the
+                // picture and showed black flashes otherwise.
+                glClear((fo2InRace() ? GL_COLOR_BUFFER_BIT : 0) | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+            }
         }
         m_fboDirty = true;
         nfsWaitAdd(3, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - s0).count());
@@ -2726,19 +2783,41 @@ void IDirect3DDevice9GLES::bindRenderTarget() {
     if (!offscreen) {
         glBindFramebuffer(GL_FRAMEBUFFER, m_bbFbo);  // 0: the window itself
     } else {
-        glBindFramebuffer(GL_FRAMEBUFFER, m_fbo);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, rt->getTarget(), rt->getGLTexture(), rt->getLevel());
+        // The Mali flushes (and can wait for) the pending rendering of a framebuffer object whose attachments change, so
+        // each target keeps its own object and a switch is only a bind: 22 switches a race frame cost 3 to 8 ms of the
+        // render thread with the single re-attached object. FO2_FBO_CACHE=0: as before.
+        static const bool useCache = [] { const char* e = std::getenv("FO2_FBO_CACHE"); return !(e && e[0] == '0'); }();
         GLuint rb = (m_currentDepthBuffer && m_currentDepthBuffer != m_defaultDepthBuffer) ? m_currentDepthBuffer->getGLRenderbuffer() : 0;
         // The default depth buffer belongs to the window; an offscreen target paired with it gets the
         // default depth surface's own renderbuffer when it has one.
         if (!rb && m_currentDepthBuffer) rb = m_currentDepthBuffer->getGLRenderbuffer();
-        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rb);
         const bool stencil = rb && m_currentDepthBuffer && m_currentDepthBuffer->hasStencil();
-        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, stencil ? rb : 0);
-        GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-        if (st != GL_FRAMEBUFFER_COMPLETE) {
-            static int s_n = 0;
-            if (s_n++ < 10) std::fprintf(stderr, "[D3D9 GLES] Framebuffer incomplete: 0x%X (rt %ux%u depth=%p)\n", st, m_rtWidth, m_rtHeight, static_cast<void*>(m_currentDepthBuffer));
+        GLuint fbo = m_fbo;
+        bool attach = true;
+        if (useCache) {
+            if (m_fboCacheGeneration != glsc::attachmentGeneration()) {   // a texture or renderbuffer went: its name may come back
+                for (auto& e : m_fboCache) glDeleteFramebuffers(1, &e.second);
+                m_fboCache.clear();
+                m_deadTargets.clear();
+                m_fboCacheGeneration = glsc::attachmentGeneration();
+            }
+            const uint64_t key = (uint64_t(rt->getGLTexture()) << 32) | (uint64_t(rb & 0xFFFFF) << 12) | (uint64_t(rt->getLevel() & 0xF) << 8) |
+                                 (uint64_t(rt->getTarget() & 0x3F) << 1) | (stencil ? 1 : 0);
+            GLuint& slot = m_fboCache[key];
+            attach = slot == 0;
+            if (attach) glGenFramebuffers(1, &slot);
+            fbo = slot;
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        if (attach) {
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, rt->getTarget(), rt->getGLTexture(), rt->getLevel());
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rb);
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, stencil ? rb : 0);
+            GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+            if (st != GL_FRAMEBUFFER_COMPLETE) {
+                static int s_n = 0;
+                if (s_n++ < 10) std::fprintf(stderr, "[D3D9 GLES] Framebuffer incomplete: 0x%X (rt %ux%u depth=%p)\n", st, m_rtWidth, m_rtHeight, static_cast<void*>(m_currentDepthBuffer));
+            }
         }
     }
     m_fboDirty = false;
@@ -2756,6 +2835,8 @@ STDMETHODIMP IDirect3DDevice9GLES::SetRenderTarget(DWORD RenderTargetIndex, IDir
                     m_currentRenderTarget->getHeight(), getD3D9PresentCount());
     }
     bindRenderTarget();
+    if (traceFrame() >= 0 && static_cast<int>(getD3D9PresentCount()) == traceFrame())
+        std::printf("[TRACE] SetRenderTarget %s tex=%u %ux%u\n", m_currentRenderTarget == m_defaultBackBuffer ? "bb" : "tex", m_currentRenderTarget->getGLTexture(), m_rtWidth, m_rtHeight);
     // D3D9: setting a render target resets the viewport and scissor rect to the full target.
     m_viewport = {0, 0, m_rtWidth, m_rtHeight, 0.0f, 1.0f};
     m_scissorRect = {0, 0, static_cast<LONG>(m_rtWidth), static_cast<LONG>(m_rtHeight)};
@@ -2808,7 +2889,17 @@ static bool shadowFrameSkipped() { return shadowEvery() > 1 && getD3D9PresentCou
 static const void* g_shadowTarget = nullptr;
 
 STDMETHODIMP IDirect3DDevice9GLES::Clear(DWORD Count, const D3DRECT* pRects, DWORD Flags, D3DCOLOR Color, float Z, DWORD Stencil) {
+    if (traceFrame() >= 0 && static_cast<int>(getD3D9PresentCount()) == traceFrame())
+        std::printf("[TRACE] Clear flags=%lu rects=%lu rt=%s %ux%u vp=%lu,%lu %lux%lu scissor=%lu\n", (unsigned long)Flags, (unsigned long)Count, m_currentRenderTarget == m_defaultBackBuffer ? "bb" : "tex", m_rtWidth, m_rtHeight,
+                    (unsigned long)m_viewport.X, (unsigned long)m_viewport.Y, (unsigned long)m_viewport.Width, (unsigned long)m_viewport.Height, (unsigned long)m_rs[D3DRS_SCISSORTESTENABLE]);
     if (g_shadowTarget && g_shadowTarget == m_currentRenderTarget && shadowFrameSkipped()) return D3D_OK;
+    // Off-screen targets whose last draw could not be drawn at all (the bloom chain's blur passes, 5 clears a frame):
+    // nothing readable ends up in them, so clearing them only costs render passes. FO2_DEAD_TARGETS=0: cleared as before.
+    {
+        static const bool skipDead = [] { const char* e = std::getenv("FO2_DEAD_TARGETS"); return !(e && e[0] == '0'); }();
+        if (skipDead && !m_deadTargets.empty() && m_currentRenderTarget && m_currentRenderTarget != m_defaultBackBuffer &&
+            m_deadTargets.count(m_currentRenderTarget->getGLTexture())) return D3D_OK;
+    }
     if (m_fboDirty) bindRenderTarget();
     GLbitfield mask = 0;
     if (Flags & D3DCLEAR_TARGET) {
@@ -2828,7 +2919,6 @@ STDMETHODIMP IDirect3DDevice9GLES::Clear(DWORD Count, const D3DRECT* pRects, DWO
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDepthMask(GL_TRUE);
     glStencilMask(0xFF);
-    glEnable(GL_SCISSOR_TEST);
     // D3D9 clears the viewport rectangle (optionally intersected with rects, and with the scissor).
     auto clearRect = [&](LONG l, LONG t, LONG r, LONG b) {
         l = std::max<LONG>(l, m_viewport.X);
@@ -2840,8 +2930,15 @@ STDMETHODIMP IDirect3DDevice9GLES::Clear(DWORD Count, const D3DRECT* pRects, DWO
             r = std::min(r, m_scissorRect.right); b = std::min(b, m_scissorRect.bottom);
         }
         if (r <= l || b <= t) return;
-        const GLint y = m_rtFlip ? t : static_cast<GLint>(m_rtHeight) - b;
-        glScissor(l, y, r - l, b - t);
+        // A clear of the whole target goes without the scissor test: a tile-based GPU (the Mali) can then drop the
+        // target's previous contents instead of loading them back for every tile. FO2_TILER_HINTS=0: always scissored.
+        if (tilerHints() && l <= 0 && t <= 0 && r >= static_cast<LONG>(m_rtWidth) && b >= static_cast<LONG>(m_rtHeight)) {
+            glDisable(GL_SCISSOR_TEST);
+        } else {
+            glEnable(GL_SCISSOR_TEST);
+            const GLint y = m_rtFlip ? t : static_cast<GLint>(m_rtHeight) - b;
+            glScissor(l, y, r - l, b - t);
+        }
         { glsc::DriverCpuTimer timer; glClear(mask); }
     };
     if (Count && pRects) {
@@ -3647,6 +3744,9 @@ bool IDirect3DDevice9GLES::prepareDraw(const void* upData, UINT upStride, INT ba
     }
 
     // ---- pixel stage ----
+    // FO2_NO_DISCARD=0: every pixel shader keeps its alpha test code, as before
+    static const bool noDiscard = [] { const char* e = std::getenv("FO2_NO_DISCARD"); return !(e && e[0] == '0'); }();
+    const bool alphaTestOn = !noDiscard || (m_rs[D3DRS_ALPHATESTENABLE] && m_rs[D3DRS_ALPHAFUNC] != D3DCMP_ALWAYS);
     const ShaderVariant* psVar = nullptr;
     GLuint psHandle = 0;
     int ffpStages = 0;
@@ -3655,7 +3755,7 @@ bool IDirect3DDevice9GLES::prepareDraw(const void* upData, UINT upStride, INT ba
         for (int s = 0; s < kMaxStages; ++s) {
             if (m_boundTextures[s] && m_boundTextures[s]->GetType() == D3DRTYPE_CUBETEXTURE) cubeMask |= 1u << s;
         }
-        psVar = m_boundPS->getVariant(cubeMask | (fogMode << kFogShift));
+        psVar = m_boundPS->getVariant(cubeMask | (fogMode << kFogShift) | (alphaTestOn ? kAlphaTestBit : 0u));
         if (!psVar) return false;
         psHandle = psVar->glShader;
     } else {
@@ -3691,19 +3791,23 @@ bool IDirect3DDevice9GLES::prepareDraw(const void* upData, UINT upStride, INT ba
         std::string key(reinterpret_cast<const char*>(st), sizeof(FFPStage) * ffpStages);
         key.push_back(m_rs[D3DRS_SPECULARENABLE] ? 1 : 0);
         key.push_back(static_cast<char>(fogMode));
+        key.push_back(alphaTestOn ? 1 : 0);
         key.append(reinterpret_cast<const char*>(&mojoMask), sizeof mojoMask);
         auto& psCache = m_pipelineManager.ffpPSByKey;
         auto it = psCache.find(key);
         if (it == psCache.end())
-            it = psCache.emplace(key, m_pipelineManager.getFFPPixelShader(ffpPixelSource(st, ffpStages, m_rs[D3DRS_SPECULARENABLE] != 0, fogMode, mojoMask))).first;
+            it = psCache.emplace(key, m_pipelineManager.getFFPPixelShader(ffpPixelSource(st, ffpStages, m_rs[D3DRS_SPECULARENABLE] != 0, fogMode, mojoMask, alphaTestOn))).first;
         psHandle = it->second;
     }
 
     LinkedProgram* lp = m_pipelineManager.getProgram(vsHandle, psHandle, programmableVS ? vsVar : nullptr, psVar);
     if (!lp || (instanceLayout && lp->instanceRegistersLoc == -1)) {
         if (instanceLayout && instancingUnavailable) *instancingUnavailable = true;
+        // A program that cannot link (the bloom passes, off by default): its off-screen target is dead, see Clear
+        if (!lp && m_rtFlip && m_currentRenderTarget) m_deadTargets.insert(m_currentRenderTarget->getGLTexture());
         return false;
     }
+    if (m_rtFlip && !m_deadTargets.empty() && m_currentRenderTarget) m_deadTargets.erase(m_currentRenderTarget->getGLTexture());
     if (lp != m_currentProgram) {
         glUseProgram(lp->program);
         m_currentProgram = lp;
@@ -3996,6 +4100,29 @@ void IDirect3DDevice9GLES::patchParticleStrip(D3DPRIMITIVETYPE type, UINT start,
 // The bytes a draw reads from the bound buffers, recorded for glesUploadLockedRange (a later NOOVERWRITE update
 // over them this frame gets fresh storage instead of overwriting what the pending draw will read).
 void IDirect3DDevice9GLES::noteBufferReads(UINT firstVertex, UINT vertices, UINT indexLo, UINT indexHi) {
+    // Indexed draw from a lazy vertex buffer: the range comes from the indices themselves, not from the game's
+    // MinVertexIndex / NumVertices, which D3D9 does not enforce (a vertex outside it would never be uploaded).
+    if (m_boundIB && indexHi > indexLo && m_noteBaseVertex != INT_MIN) {
+        bool lazy = false;
+        for (const StreamBinding& sb : m_streams) if (sb.buffer && sb.buffer->lazyStorage()) { lazy = true; break; }
+        if (lazy && indexHi <= m_boundIB->getLength()) {
+            uint32_t lo = 0xFFFFFFFFu, hi = 0;
+            const uint8_t* d = m_boundIB->getData();
+            if (m_boundIB->getFormat() == D3DFMT_INDEX16) {
+                const uint16_t* p = reinterpret_cast<const uint16_t*>(d + indexLo);
+                for (UINT i = 0, n = (indexHi - indexLo) / 2; i < n; ++i) { const uint32_t v = p[i]; lo = std::min(lo, v); hi = std::max(hi, v); }
+            } else {
+                const uint32_t* p = reinterpret_cast<const uint32_t*>(d + indexLo);
+                for (UINT i = 0, n = (indexHi - indexLo) / 4; i < n; ++i) { const uint32_t v = p[i]; lo = std::min(lo, v); hi = std::max(hi, v); }
+            }
+            if (lo <= hi) {
+                const int64_t first = int64_t(m_noteBaseVertex) + lo;
+                firstVertex = static_cast<UINT>(std::max<int64_t>(0, first));
+                vertices = hi - lo + 1;
+            }
+        }
+    }
+    m_noteBaseVertex = INT_MIN;
     for (const StreamBinding& sb : m_streams) {
         if (!sb.buffer || !sb.stride) continue;
         const uint64_t lo = uint64_t(sb.offset) + uint64_t(firstVertex) * sb.stride, hi = lo + uint64_t(vertices) * sb.stride;
@@ -4061,13 +4188,17 @@ void IDirect3DDevice9GLES::tracePositions(D3DPRIMITIVETYPE type, UINT start, UIN
     }
 }
 
+// FO2_EXP_NODRAW (diagnostics): 1 skips the GL draw call itself (the GPU and the driver's draw cost go), 2 skips the whole draw
+static int expNoDraw() { static const int v = [] { const char* e = std::getenv("FO2_EXP_NODRAW"); return e ? std::atoi(e) : 0; }(); return v; }
 STDMETHODIMP IDirect3DDevice9GLES::DrawPrimitive(D3DPRIMITIVETYPE PrimitiveType, UINT StartVertex, UINT PrimitiveCount) {
     if (!PrimitiveCount) return D3D_OK;
     traceDraw("DP", PrimitiveCount);
     if (traceFrame() >= 0 && static_cast<int>(getD3D9PresentCount()) == traceFrame()) tracePositions(PrimitiveType, StartVertex, PrimitiveCount);
     if (traceFrame() >= 0 && static_cast<int>(getD3D9PresentCount()) == traceFrame() && traceSkipCurrent("DP", PrimitiveCount)) return D3D_OK;
+    if (expNoDraw() == 2) return D3D_OK;
     patchParticleStrip(PrimitiveType, StartVertex, primitiveCountToVertexCount(PrimitiveType, PrimitiveCount));
     if (!prepareDraw(nullptr, 0, 0)) return D3D_OK;
+    if (expNoDraw() == 1) return D3D_OK;
     noteBufferReads(StartVertex, primitiveCountToVertexCount(PrimitiveType, PrimitiveCount), 0, 0);
     { DrawTimer timer;
     glDrawArrays(convertPrimitiveType(PrimitiveType), StartVertex, primitiveCountToVertexCount(PrimitiveType, PrimitiveCount)); }
@@ -4155,10 +4286,13 @@ STDMETHODIMP IDirect3DDevice9GLES::DrawIndexedPrimitive(D3DPRIMITIVETYPE Primiti
     static const DrawBaseFn drawBase = reinterpret_cast<DrawBaseFn>(SDL_GL_GetProcAddress("glDrawElementsBaseVertex"));
     static const DrawRangeBaseFn drawRangeBase = reinterpret_cast<DrawRangeBaseFn>(SDL_GL_GetProcAddress("glDrawRangeElementsBaseVertex"));
     const bool useBase = drawPath >= 1 && drawBase && drawRangeBase;
+    if (expNoDraw() == 2) return D3D_OK;
     if (!prepareDraw(nullptr, 0, useBase ? 0 : BaseVertexIndex)) return D3D_OK;
+    if (expNoDraw() == 1) return D3D_OK;
     const bool i16 = m_boundIB->getFormat() == D3DFMT_INDEX16;
     {
         const UINT isz = i16 ? 2 : 4, first = StartIndex * isz;
+        m_noteBaseVertex = BaseVertexIndex;
         noteBufferReads(static_cast<UINT>(std::max(0, BaseVertexIndex + static_cast<INT>(MinVertexIndex))), NumVertices,
                         first, first + primitiveCountToVertexCount(PrimitiveType, PrimitiveCount) * isz);
     }
@@ -4219,6 +4353,11 @@ bool IDirect3DDevice9GLES::drawIndexedInstanced(D3DPRIMITIVETYPE type, INT baseV
     traceDraw("DIPI", primitives);
     bool unavailable = false;
     if (!prepareDraw(nullptr, 0, baseVertex, layout, &unavailable)) return !unavailable;   // nothing to draw, as DrawIndexedPrimitive
+    {
+        const UINT isz = m_boundIB->getFormat() == D3DFMT_INDEX16 ? 2 : 4, first = startIndex * isz;
+        m_noteBaseVertex = baseVertex;
+        noteBufferReads(static_cast<UINT>(std::max(0, baseVertex + static_cast<INT>(minVertex))), numVertices, first, first + primitiveCountToVertexCount(type, primitives) * isz);
+    }
     LinkedProgram* lp = m_currentProgram;
     const GLuint instanceNumberLocation = static_cast<GLuint>(lp->vs->attributes.size());
     glBindBuffer(GL_ARRAY_BUFFER, m_instancing.instanceNumbers);

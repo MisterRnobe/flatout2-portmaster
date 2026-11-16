@@ -10,19 +10,36 @@ FlatOut 2 (PC) statically recompiled to native ARM64 Linux, as a PortMaster-styl
 
 | RG34XX-SP | RG351P | GKD Pixel II |
 |---|---|---|
-| <a href="images/rg34xx-sp.png"><img src="images/rg34xx-sp.png" height="220" alt="RG34XX-SP"></a> | <a href="images/rg351p.png"><img src="images/rg351p.png" height="220" alt="RG351P"></a> | <a href="images/gkd-pixel2.png"><img src="images/gkd-pixel2.png" height="220" alt="GKD Pixel II"></a> |
+| <a href="images/rg34xx-sp-v1.1.0.png"><img src="images/rg34xx-sp-v1.1.0.png" height="220" alt="RG34XX-SP"></a> | <a href="images/rg351p-v1.1.0.png"><img src="images/rg351p-v1.1.0.png" height="220" alt="RG351P"></a> | <a href="images/gkd-pixel2-v1.1.0.png"><img src="images/gkd-pixel2-v1.1.0.png" height="220" alt="GKD Pixel II"></a> |
 
 Click an image to see it at its real resolution.
 
 ## Tested consoles
 
-| Console | Chip | CPU | GPU | OS | Render size | Launcher | Average FPS | Min | 1% low |
-|---|---|---|---|---|---|---|---|---|---|
-| Anbernic RG34XX-SP (2 GB) | H700 | Cortex-A53 | Mali-G31 MP2 | Knulli Scarab | 648x432 | FPS Unlock | 39 | 28 | 23 |
-| Anbernic RG351P | RK3326 | Cortex-A35 | Mali-G31 MP2 | dArkOS | 480x320 | 30 FPS | 26 | 15 | 15 |
-| GKD Pixel II | RK3326S | Cortex-A35 | Mali-G31 2EE | ROCKNIX | 640x480 | 30 FPS | 25 | 12 | 12 |
+| Console | Chip | CPU | GPU | OS | Render size | Average FPS | Min | 1% low |
+|---|---|---|---|---|---|---|---|---|
+| Anbernic RG34XX-SP (2 GB) | H700 | Cortex-A53 | Mali-G31 MP2 | Knulli Scarab | 648x432 | 52 | 40 | 20 |
+| Anbernic RG351P | RK3326 | Cortex-A35 | Mali-G31 MP2 | dArkOS | 480x320 | 33 | 20 | 18 |
+| GKD Pixel II | RK3326S | Cortex-A35 | Mali-G31 2EE | ROCKNIX | 640x480 | 36 | 23 | 17 |
 
 Measured with the port's own FPS counter by playing one lap on the same track with the same car, in similar driving, with busy moments and quiet ones. These are the figures shown on the screenshots above: expect some variation between races.
+
+### Version 1.0.0 against 1.1.0
+
+Same track, same car, one lap each time.
+
+| Console | Average FPS | Min | 1% low |
+|---|---|---|---|
+| RG34XX-SP | 39 → 52 | 28 → 40 | 23 → 20 |
+| RG351P | 26 → 33 | 15 → 20 | 15 → 18 |
+| GKD Pixel II | 25 → 36 | 12 → 23 | 12 → 17 |
+
+Version 1.0.0 was limited to 30 FPS on the RG351P and the GKD Pixel II; version 1.1.0 is not. The two RG351P runs were made on two consoles of the same model.
+
+| | RG34XX-SP | RG351P | GKD Pixel II |
+|---|---|---|---|
+| 1.0.0 | <a href="images/rg34xx-sp.png"><img src="images/rg34xx-sp.png" height="160" alt="RG34XX-SP, 1.0.0"></a> | <a href="images/rg351p.png"><img src="images/rg351p.png" height="160" alt="RG351P, 1.0.0"></a> | <a href="images/gkd-pixel2.png"><img src="images/gkd-pixel2.png" height="160" alt="GKD Pixel II, 1.0.0"></a> |
+| 1.1.0 | <a href="images/rg34xx-sp-v1.1.0.png"><img src="images/rg34xx-sp-v1.1.0.png" height="160" alt="RG34XX-SP, 1.1.0"></a> | <a href="images/rg351p-v1.1.0.png"><img src="images/rg351p-v1.1.0.png" height="160" alt="RG351P, 1.1.0"></a> | <a href="images/gkd-pixel2-v1.1.0.png"><img src="images/gkd-pixel2-v1.1.0.png" height="160" alt="GKD Pixel II, 1.1.0"></a> |
 
 Other consoles are not tested. The launcher tries to adapt to the screen and video driver of an unknown console, but it may need work: please open an issue with your console, your OS and `ports/flatout2/log.txt`.
 
@@ -34,16 +51,15 @@ You need the **GOG / Zoom Platform** version of the game (v2.1.0.9). Its `FlatOu
 
 ## Install
 
-1. Copy both launchers and the `flatout2` folder from the release zip into your `ports` folder.
+1. Copy the launcher `FlatOut 2.sh` and the `flatout2` folder from the release zip into your `ports` folder.
 2. Copy everything from your game's folder into `ports/flatout2/gamedata/`. About 3 GB are needed.
-3. Start one of the two launchers from the Ports menu:
+3. Start `FlatOut 2` from the Ports menu.
 
-| Launcher | Frame rate |
-|---|---|
-| `FlatOut 2 [RK3326 - 30 FPS].sh` | limited to 30 FPS: steadier on small chips |
-| `FlatOut 2 [H700 - FPS Unlock].sh` | up to 60 FPS |
+The first race after an install or an update can stutter for a moment: the port is filling its shader cache. It does not come back afterwards.
 
-The names are only a guide: either one runs on any console.
+### Updating from 1.0.0
+
+Replace `ports/flatout2/fo2.aarch64` with the new one, copy the new `FlatOut 2.sh`, and delete the two old launchers (`FlatOut 2 [RK3326 - 30 FPS].sh` and `FlatOut 2 [H700 - FPS Unlock].sh`). Your game files and your saves stay as they are.
 
 ## Controls
 
@@ -77,22 +93,20 @@ The names are only a guide: either one runs on any console.
 - **LAN play does not work.** The menu is there, but the feature is not finished.
 - Online play is not available.
 - Small graphical glitches can appear with the sparks when cars touch.
-- At random, the sound of your own car can be missing from the start of a race. Most races are fine.
-- When that happens on a car with jet engines, their flames are missing too.
-- On RK3326 consoles, big crashes can drop the frame rate under 20 FPS for a moment.
+- On RK3326 consoles, big crashes can still drop the frame rate for a moment.
+- Short silences can remain in the music during loading screens.
 
 ## Roadmap
 
-- **Performance:** lighter rendering (fewer draw calls, simpler shaders) and faster physics on small chips, where big crashes cost the most.
-- **Audio:** fix the missing car sound.
-- **Graphics:** fix the spark glitches.
 - **LAN multiplayer** between consoles on the same Wi-Fi network.
+- **Graphics:** fix the spark glitches.
+- **Performance:** the heaviest moments on small chips.
 - More consoles and screen formats, with your reports.
 - A way to change the controls from the port.
 
 ## Version
 
-Current version: **1.0.0**.
+Current version: **1.1.0**. See the [Releases](https://github.com/badcats72/flatout2-portmaster/releases) for what changed.
 
 ## Advanced settings
 
@@ -100,11 +114,12 @@ Optional file `ports/flatout2/fo2.env`, one `VARIABLE=value` per line:
 
 | Variable | Effect |
 |---|---|
-| `FO2_CAP=60` | Frame rate limit |
+| `FO2_CAP=30` | Frame rate limit (60 by default). 30 gives a steadier picture on small chips |
 | `FO2_RENDER=640x480` | Render size |
 | `FO2_SWAP_ABXY=1` | Start with A/B and X/Y swapped |
 | `FO2_KEEP_SETTINGS=1` | Keep the game's own graphics settings (the launcher otherwise forces the lowest) |
 | `NFSU2_SHOW_FPS=1` | FPS counter on at launch |
+| `NFSU2_PARALLEL_THREADS=` | Empty: the sound engine's threads take turns with the game again, as in 1.0.0. Only for diagnosing a sound problem |
 
 ## Source code
 

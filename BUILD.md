@@ -50,4 +50,27 @@ The result is `work\host-build\fo2.aarch64`. Copy it into `ports/flatout2/` next
 
 After changing only the runtime (`runtime/`), running `build_host.ps1` again is enough. After changing `config/hooks.txt`, `config/overrides.txt` or `config/skippable.txt`, lift again with `scripts/run_lift.py lift`, then repeat steps 2 and 3.
 
+## Optional: profile-guided optimisation
+
+The binary in the Release is built this way; it makes the game's own code about 6 to 9% faster. Zig compiles with `-fprofile-generate` and `-fprofile-use`, but ships neither the profile runtime nor `llvm-profdata`: take both from the LLVM release matching `zig cc --version` (`llvm-profdata.exe` from the Windows installer, `compiler-rt/lib/profile` and `compiler-rt/include/profile` from the sources).
+
+1. Compile the profile runtime (every `InstrProfiling*.c` except the Darwin, AIX, Fuchsia, Windows and Other platform files, plus `InstrProfilingRuntime.cpp`) for `aarch64-linux-gnu.2.28` with `-DCOMPILER_RT_HAS_ATOMICS=1 -DCOMPILER_RT_HAS_FCNTL_LCK=1 -DCOMPILER_RT_HAS_UNAME=1`.
+2. Build an instrumented game, with those objects copied into its object folder:
+
+```powershell
+& "$repo\scripts\build_guest.ps1" -Zig $zig -Gen $gen -Out "$repo\work\guest-obj-pgogen" -Pcrecomp $pc -Runtime "$repo\runtime\guest" -ExtraFlags '-fprofile-generate','-mllvm','-enable-name-compression=false'
+& "$repo\scripts\build_host.ps1" -Zig $zig -Guest "$repo\work\guest-obj-pgogen" -DevLibs $libs -Out "$repo\work\host-build"
+```
+
+3. Play a race on a console with `LLVM_PROFILE_FILE=/tmp/fo2.profraw` and `FO2_PROF_DUMP_SEC=170` in `fo2.env`: the counters are written 170 seconds after the first frame.
+4. Merge the profile and build with it:
+
+```powershell
+llvm-profdata merge -o fo2.profdata fo2.profraw
+& "$repo\scripts\build_guest.ps1" -Zig $zig -Gen $gen -Out "$repo\work\guest-obj-pgo" -Pcrecomp $pc -Runtime "$repo\runtime\guest" -ExtraFlags "-fprofile-use=<path>\fo2.profdata",'-Wno-profile-instr-out-of-date','-Wno-profile-instr-unprofiled'
+& "$repo\scripts\build_host.ps1" -Zig $zig -Guest "$repo\work\guest-obj-pgo" -DevLibs $libs -Out "$repo\work\host-build"
+```
+
+The profile belongs to one lift: take it again after lifting again.
+
 `docs/NOTES.md` is the project's working journal: how the game was analysed, what was tried, and what failed.

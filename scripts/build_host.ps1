@@ -9,7 +9,9 @@ param(
     [Parameter(Mandatory)] [string]$Guest,
     [Parameter(Mandatory)] [string]$DevLibs,
     [Parameter(Mandatory)] [string]$Out,
-    [int]$Jobs = [Environment]::ProcessorCount
+    [int]$Jobs = [Environment]::ProcessorCount,
+    # linker script placing the hot functions together; the guest objects must be built with -ffunction-sections
+    [string]$OrderFile = ''
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -20,7 +22,7 @@ $mojo = "$root\third_party\mojoshader"
 New-Item -ItemType Directory -Force "$Out\obj", "$Out\stubs" | Out-Null
 
 $target = @('-target', 'aarch64-linux-gnu.2.28', '-mcpu=cortex_a53')
-$opt = @('-O2', '-g', '-DNDEBUG', '-fno-strict-aliasing', '-ffp-contract=off')
+$opt = @('-O2', '-g', '-DNDEBUG', '-fno-strict-aliasing', '-ffp-contract=off', '-ffunction-sections')
 $mojoDef = @('-DSUPPORT_PROFILE_ARB1=0', '-DSUPPORT_PROFILE_ARB1_NV=0', '-DSUPPORT_PROFILE_HLSL=0', '-DSUPPORT_PROFILE_METAL=0',
     '-DSUPPORT_PROFILE_D3D=0', '-DSUPPORT_PROFILE_BYTECODE=0', '-DSUPPORT_PROFILE_SPIRV=0', '-DSUPPORT_PROFILE_GLSPIRV=0',
     '-DMOJOSHADER_DEPTH_CLIPPING', '-DMOJOSHADER_FLIP_RENDERTARGET')
@@ -85,6 +87,7 @@ $objs = @(Get-ChildItem "$Out\obj\*.o" | ForEach-Object FullName) + @(Get-ChildI
 $link = @('c++', '-o', "$Out\fo2.aarch64") + $target + $objs + @("$DevLibs\libSDL2-2.0.so.0",
     "$Out\stubs\libGLESv2.so.2", "$Out\stubs\libEGL.so.1", '-lpthread', '-ldl', '-lm', '-rdynamic', '-no-pie',
     '-Wl,--allow-shlib-undefined')
+if ($OrderFile) { $link += @("-Wl,-T,$OrderFile") }   # a linker script: SECTIONS { .text.hot : { *(.text.<function>) ... } } INSERT BEFORE .text;
 $result = & $Zig @link 2>&1 | Out-String
 if ($LASTEXITCODE -ne 0) {
     $undef = [regex]::Matches($result, 'undefined symbol: (\S+)') | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique

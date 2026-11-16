@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <cmath>
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include "audio_resampler.h"
 struct PcmVoice {
     std::vector<uint8_t> samples;
@@ -20,6 +22,73 @@ struct PcmVoice {
     static constexpr unsigned granule=64;
     std::vector<uint8_t> fresh;
     uint64_t staleGranules=0,playedGranules=0;
+    // Streaming FIFO (FO2_AUDIO_FIFO=0 turns it off). FMOD mixes everything into one 93 ms ring; when the guest's
+    // mixer thread is late (long frames on small chips: it only runs when the game thread lets the guest machine go)
+    // the output played the ring's old contents again: music and sounds stuttered (GitHub issue 1, R50S). The blocks
+    // the guest publishes while the ring plays are queued here instead and played in order. When the queue runs dry
+    // the voice is silent until it holds fifoTarget frames again, and fifoTarget grows to the length of the dry
+    // spell (spells up to 150 ms; longer ones are loading screens): the latency adapts to the console, and stays what it
+    // was where the guest keeps up.
+    // The play cursor the guest reads (position) keeps moving with time either way.
+    std::vector<uint8_t> fifo;
+    size_t fifoRead=0,fifoAvail=0,fifoTarget=0,fifoDry=0;   // byte index, frames, frames, source frames
+    double fifoFrac=0;
+    bool fifoActive=false,fifoWaiting=true,fifoStarted=false,fifoDryFrozen=false;   // fifoDryFrozen: new data came, the dry spell is measured
+    uint64_t fifoUnderruns=0;
+    size_t fifoWinMin=~size_t(0),fifoWinFrames=0;bool fifoFast=false;
+    static bool fifoEnabled(){static const bool on=[]{const char* e=std::getenv("FO2_AUDIO_FIFO");return !(e&&e[0]=='0');}();return on;}
+    // FO2_AUDIO_DELAY_MS: the queue's starting depth (default 20 ms; it only grows from there)
+    static unsigned fifoStartMs(){static const unsigned ms=[]{const char* e=std::getenv("FO2_AUDIO_DELAY_MS");const int n=e?std::atoi(e):20;return unsigned(n<0?0:n>250?250:n);}();return ms;}
+    void fifoReset(){fifoActive=false;fifoRead=fifoAvail=fifoDry=0;fifoFrac=0;fifoWaiting=true;fifoStarted=false;fifoDryFrozen=false;fifoFast=false;fifoWinMin=~size_t(0);fifoWinFrames=0;}
+    void fifoDrop(size_t frames){frames=std::min(frames,fifoAvail);fifoRead=(fifoRead+frames*block())%fifo.size();fifoAvail-=frames;}
+    void fifoPush(const uint8_t* data,size_t bytes){
+        const size_t blk=block(),frames=bytes/blk;if(!frames)return;
+        if(fifo.empty()){fifo.assign(size_t(65536)*blk,0);fifoTarget=size_t(frequency)*fifoStartMs()/1000;}
+        const size_t capacity=fifo.size()/blk;
+        if(frames>=capacity)return;
+        if(fifoAvail+frames>capacity)fifoDrop(fifoAvail+frames-capacity);
+        size_t at=(fifoRead+fifoAvail*blk)%fifo.size();
+        const size_t first=std::min(frames*blk,fifo.size()-at);
+        std::memcpy(fifo.data()+at,data,first);if(first<frames*blk)std::memcpy(fifo.data(),data+first,frames*blk-first);
+        fifoAvail+=frames;fifoActive=true;if(fifoWaiting)fifoDryFrozen=true;
+        // never more than the target plus two rings behind: the guest caught up after a lost lap, or the output stalled
+        const size_t ring=samples.size()/blk;
+        if(fifoAvail>fifoTarget+2*ring)fifoDrop(fifoAvail-(fifoTarget+ring));
+    }
+    float fifoSample(size_t frame,unsigned channel)const{
+        const size_t offset=(fifoRead+frame*block()+std::min(channel,channels-1)*(bits/8))%fifo.size();
+        if(bits==8)return (int(fifo[offset])-128)/128.f;
+        const uint16_t word=uint16_t(fifo[offset])|(uint16_t(fifo[(offset+1)%fifo.size()])<<8);
+        return static_cast<int16_t>(word)/32768.f;
+    }
+    // one output frame; step = source frames per output frame
+    void fifoMix(float* out,double step){
+        if(fifoWaiting){
+            if(fifoAvail>=std::max<size_t>(fifoTarget,2)){
+                // a spell over 150 ms is a loading screen or a pause, not a late frame: it does not count
+                if(fifoStarted&&fifoDry<=size_t(frequency)*3/20)fifoTarget=std::max(fifoTarget,fifoDry+256);
+                fifoWaiting=false;fifoStarted=true;fifoDry=0;
+            }else{if(!fifoDryFrozen)fifoDry+=size_t(step+0.5);return;}
+        }
+        if(fifoAvail<2){fifoWaiting=true;fifoDry=0;fifoDryFrozen=false;++fifoUnderruns;fifoFast=false;fifoWinMin=~size_t(0);fifoWinFrames=0;return;}
+        // Back to a short queue when the cushion was not needed: over each 30 s without a dry spell the lowest level is
+        // kept; if more than the starting depth plus 10 ms was always left, the next window plays 1% faster until the
+        // queue is down to that (menus and loading screens leave it deep, a race on a fast console does not need it).
+        {
+            const size_t floorFrames=size_t(frequency)*(fifoStartMs()+10)/1000;
+            fifoWinMin=std::min(fifoWinMin,fifoAvail);
+            if(++fifoWinFrames>=size_t(frequency)*30){
+                fifoFast=fifoWinMin!=~size_t(0)&&fifoWinMin>floorFrames;
+                if(fifoFast)fifoTarget=size_t(frequency)*fifoStartMs()/1000;
+                fifoWinMin=~size_t(0);fifoWinFrames=0;
+            }
+            if(fifoFast){if(fifoAvail>floorFrames)step*=1.01;else fifoFast=false;}
+        }
+        const float f=float(fifoFrac);
+        for(unsigned c=0;c<2;++c){const float a=fifoSample(0,c),b=fifoSample(1,c);out[c]+=(a+(b-a)*f)*(c?right:left);}
+        fifoFrac+=step;
+        while(fifoFrac>=1&&fifoAvail){fifoFrac-=1;fifoDrop(1);}
+    }
     void markWritten(size_t firstByte,size_t bytes){
         if(!bytes)return;
         if(fresh.empty())fresh.assign(samples.size()/block()/granule+1,0);
@@ -63,6 +132,7 @@ public:
             size_t lastGranule=size_t(voice->position)/PcmVoice::granule;
             for(unsigned frame=0;frame<frames;++frame){
                 if(voice->position>=count){if(voice->loop)voice->position=std::fmod(voice->position,double(count));else{voice->playing=false;voice->position=0;break;}}
+                if(voice->fifoActive){voice->fifoMix(output+frame*2,step);voice->position+=step;continue;}
                 size_t a=size_t(voice->position),b=a+1;float fraction=float(voice->position-a);
                 if(!voice->fresh.empty()&&a/PcmVoice::granule!=lastGranule){
                     lastGranule=a/PcmVoice::granule;

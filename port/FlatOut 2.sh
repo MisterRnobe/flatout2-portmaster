@@ -55,11 +55,11 @@ mkdir -p gamedata/Savegame
 
 # Per console: video driver, render size and frame rate limit.
 case "$(grep -m1 '^Hardware' /proc/cpuinfo 2>/dev/null; cat /proc/device-tree/model 2>/dev/null)" in
-  *Pixel2*) DEFAULT_DRIVER=wayland; DEFAULT_RENDER=640x480; DEFAULT_CAP=30   # ROCKNIX under Sway, GKD Pixel II (Cortex-A35, Mali-G31)
+  *Pixel2*) DEFAULT_DRIVER=wayland; DEFAULT_RENDER=640x480; DEFAULT_CAP=60   # ROCKNIX under Sway, GKD Pixel II (Cortex-A35, Mali-G31)
            export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/0-runtime-dir}" WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-1}"
            export FO2_SWAP_ABXY="${FO2_SWAP_ABXY:-1}"                       # its mapping has A/B and X/Y the other way round
            export FO2_VIDEO_THREADS="${FO2_VIDEO_THREADS:-3}" FO2_VIDEO_FAST="${FO2_VIDEO_FAST:-1}" ;;
-  *RG351*) DEFAULT_DRIVER=KMSDRM; DEFAULT_RENDER=480x320; DEFAULT_CAP=30   # dArkOS, RK3326, 480x320 panel mounted rotated
+  *RG351*) DEFAULT_DRIVER=KMSDRM; DEFAULT_RENDER=480x320; DEFAULT_CAP=60   # dArkOS, RK3326, 480x320 panel mounted rotated
            export FO2_SWAP_ABXY="${FO2_SWAP_ABXY:-1}"                       # its mapping has A/B and X/Y the other way round
            export FO2_VIDEO_THREADS="${FO2_VIDEO_THREADS:-3}" FO2_VIDEO_FAST="${FO2_VIDEO_FAST:-1}" ;;   # lighter video decoding
   *RG34XX*) DEFAULT_DRIVER=mali;  DEFAULT_RENDER=648x432; DEFAULT_CAP=60 ;;   # Knulli, RG34XX-SP
@@ -69,10 +69,10 @@ case "$(grep -m1 '^Hardware' /proc/cpuinfo 2>/dev/null; cat /proc/device-tree/mo
       SW=${DISPLAY_WIDTH:-640}; SH=${DISPLAY_HEIGHT:-480}
       [ "$SW" -lt "$SH" ] && { T=$SW; SW=$SH; SH=$T; }
       if [ "$SH" -gt 480 ]; then SW=$(( SW * 480 / SH )); SH=480; fi
-      DEFAULT_RENDER="$(( SW / 2 * 2 ))x$(( SH / 2 * 2 ))"; DEFAULT_CAP=30
+      DEFAULT_RENDER="$(( SW / 2 * 2 ))x$(( SH / 2 * 2 ))"; DEFAULT_CAP=60
       export FO2_VIDEO_THREADS="${FO2_VIDEO_THREADS:-3}" FO2_VIDEO_FAST="${FO2_VIDEO_FAST:-1}" ;;
 esac
-# Two launchers ship with the port and differ only by their name: "... 30 FPS" and "... FPS Unlock".
+# One launcher since v1.1.0, up to 60 FPS everywhere (FO2_CAP=30 in fo2.env for a steady 30). A copy named "... 30 FPS" still caps at 30.
 case "$(basename "$0")" in
   *Unlock*)   DEFAULT_CAP=60 ;;
   *"30 FPS"*) DEFAULT_CAP=30 ;;

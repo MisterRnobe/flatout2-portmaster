@@ -40,9 +40,38 @@ void tlsAlloc() {
 void tlsFree() { uint32_t i=arg(0); bool ok=i<tlsUsed.size() && tlsUsed[i]; if(ok){tlsUsed[i]=false; tlsValues[i]=0;} else lastError=87; ret(ok,1); }
 void tlsGet() {uint32_t i=arg(0); if(i>=tlsUsed.size()||!tlsUsed[i]){lastError=87;ret(0,1);}else{lastError=0;ret(tlsValues[i],1);}}
 void tlsSet() {uint32_t i=arg(0); if(i>=tlsUsed.size()||!tlsUsed[i]){lastError=87;ret(0,2);}else{tlsValues[i]=arg(1);ret(1,2);}}
+// The last critical-section operations of every thread (diagnostics for "Unbalanced LeaveCriticalSection"): E entered,
+// L left, R released by the deadlock resolver, S restored by it, I initialised, D deleted or retirement deferred.
+struct CsOp{uint32_t address;uint16_t thread;char op;uint8_t count;};
+CsOp csOps[256];std::atomic<uint32_t> csOpNext{0};
+inline void csNote(char op,uint32_t address,uint32_t count){csOps[csOpNext.fetch_add(1,std::memory_order_relaxed)&255]=CsOp{address,uint16_t(guestThreadId),op,uint8_t(count>255?255:count)};}
+void csDump(uint32_t address){
+    std::string all,same;char b[40];const uint32_t end=csOpNext.load();
+    for(uint32_t i=end>=256?end-256:0;i<end;++i){const CsOp o=csOps[i&255];std::snprintf(b,sizeof b," %c%u:%08x/%u",o.op,unsigned(o.thread),o.address,unsigned(o.count));
+        if(o.address==address)same+=b;if(end-i<=48)all+=b;}
+    NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU2","critical section %08x, its operations among the last 256:%s",address,same.c_str());
+    NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU2","last 48 critical-section operations:%s",all.c_str());
+}
 void initCritical(uint32_t address,uint32_t spin) {
+    // A section initialised again (FMOD does it at start-up) keeps its mutex and is reset under it. Replacing the mutex and
+    // clearing the fields while a thread running in parallel was entering the section left that thread with a count of 0:
+    // "Unbalanced LeaveCriticalSection" in FMOD's stream thread, one start in about eighty with NFSU2_PARALLEL_THREADS.
+    std::shared_ptr<std::recursive_mutex> existing;
+    {std::lock_guard<std::mutex> l(criticalMapMutex);auto it=criticalSections.find(address);if(it!=criticalSections.end())existing=it->second;}
+    if(existing){
+        static std::atomic<int> logged{0};
+        const bool mine=existing->try_lock();
+        if(logged.fetch_add(1)<12)NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","InitializeCriticalSection again on %08x by guest thread %u: %s (count %u owner %u)",address,guestThreadId,mine?"reset":"in use by another thread, left as it is",read32(address+8),read32(address+12));
+        csNote('I',address,mine?0:1);
+        if(!mine){std::lock_guard<std::mutex> l(criticalMapMutex);pendingCriticalDeletes.erase(address);return;}   // and it is not to be retired when that thread leaves it
+        if(read32(address+8)){existing->unlock();throw GuestStop("Reinitializing active critical section");}
+        std::memset(ptr(address,24),0,24); write32(address+4,UINT32_MAX); write32(address+20,spin);
+        {std::lock_guard<std::mutex> l(criticalMapMutex);pendingCriticalDeletes.erase(address);}
+        existing->unlock();
+        return;
+    }
+    csNote('I',address,0);
     std::lock_guard<std::mutex> l(criticalMapMutex);
-    if(criticalSections.count(address)&&read32(address+8))throw GuestStop("Reinitializing active critical section");
     pendingCriticalDeletes.erase(address);
     criticalSections[address]=std::make_shared<std::recursive_mutex>();
     std::memset(ptr(address,24),0,24); write32(address+4,UINT32_MAX); write32(address+20,spin);
@@ -93,6 +122,7 @@ void enterCritical() {
                         write32(ownerWaitsFor + 4, UINT32_MAX);
                         write32(ownerWaitsFor + 12, 0);
                         currentTrace().release(ownerWaitsFor);
+                        csNote('R',ownerWaitsFor,savedCount);
                         for(uint32_t i = 0; i < savedCount; ++i) heldMutex->unlock();
                         notifyGuestSync();
 
@@ -106,6 +136,7 @@ void enterCritical() {
                         write32(ownerWaitsFor + 4, savedCount - 1);
                         write32(ownerWaitsFor + 12, guestThreadId);
                         currentTrace().hold(ownerWaitsFor);
+                        csNote('S',ownerWaitsFor,savedCount);
                         break;
                     }
                 }
@@ -118,11 +149,21 @@ void enterCritical() {
         nfsWaitAdd(6,ns);nfsCsWait(address,ns);}
     auto count=read32(address+8)+1; write32(address+8,count); write32(address+4,count-1); write32(address+12,guestThreadId);
     if(count==1)currentTrace().hold(address);
+    csNote('E',address,count);
     ret(0,1);
 }
 void leaveCritical() {
     uint32_t address=arg(0); auto mutex=findCritical(address); uint32_t count=read32(address+8);
-    if(!mutex||!count||read32(address+12)!=guestThreadId) throw GuestStop("Unbalanced LeaveCriticalSection");
+    // Leaving a section that nobody holds (count 0, no owner): Windows lets it pass, and so does this. Seen once in about
+    // 150 starts with FMOD's threads in parallel (its stream thread, a section in a heap object), cause not found: the
+    // operations around it are logged. The host mutex is released in case this thread does hold it (a no-op otherwise).
+    if(mutex&&!count&&read32(address+12)==0){
+        static std::atomic<int> seen{0};
+        if(seen.fetch_add(1)<4){NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU2","LeaveCriticalSection %08x by guest thread %u on a section nobody holds: ignored",address,guestThreadId);csDump(address);}
+        csNote('U',address,0);currentTrace().release(address);mutex->unlock();notifyGuestSync();ret(0,1);return;
+    }
+    if(!mutex||!count||read32(address+12)!=guestThreadId){NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU2","LeaveCriticalSection %08x by guest thread %u: mutex=%d count=%u owner=%u lock count field=%d",address,guestThreadId,mutex?1:0,count,read32(address+12),int(read32(address+4)));csDump(address);throw GuestStop("Unbalanced LeaveCriticalSection");}
+    csNote('L',address,count-1);
     write32(address+8,--count);write32(address+4,count-1);if(!count){write32(address+12,0);currentTrace().release(address);}mutex->unlock();
     if(!count)notifyGuestSync();
     if(!count){std::lock_guard<std::mutex> l(criticalMapMutex);if(pendingCriticalDeletes.erase(address))criticalSections.erase(address);}
@@ -130,10 +171,17 @@ void leaveCritical() {
 }
 void deleteCritical() {
     uint32_t address=arg(0);
-    if(read32(address+8)){
+    // "Active" is decided with the mutex, not only with the count in guest memory: a thread running in parallel that has
+    // just taken the mutex has not written its count yet (the same window as in initCritical).
+    auto mutex=findCritical(address);
+    const bool free_=!mutex||mutex->try_lock();
+    const bool active=!free_||read32(address+8)!=0;
+    csNote('D',address,active?1:0);
+    if(active){
+        if(mutex&&free_)mutex->unlock();
         NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU2","Deferring deletion of active guest critical section %08x owner=%u count=%u",address,read32(address+12),read32(address+8));
         std::lock_guard<std::mutex> l(criticalMapMutex);pendingCriticalDeletes[address]=true;
-    }else{std::lock_guard<std::mutex> l(criticalMapMutex);criticalSections.erase(address);pendingCriticalDeletes.erase(address);}
+    }else{{std::lock_guard<std::mutex> l(criticalMapMutex);criticalSections.erase(address);pendingCriticalDeletes.erase(address);}if(mutex)mutex->unlock();}
     ret(0,1);
 }
 void startupInfo() {std::memset(ptr(arg(0),68),0,68);write32(arg(0),68);ret(0,1);}

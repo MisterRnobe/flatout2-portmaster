@@ -679,6 +679,17 @@ extern "C" uint32_t getD3D9PresentCount();
 struct GlesBufferUse {
     uint32_t orphanFrame = ~0u, drawFrame = ~0u;
     UINT drawLo = 0, drawHi = 0;   // bytes read by draws since drawFrame began or the last orphaning
+    // Lazy storage (large dynamic buffers): a new storage starts empty instead of being filled with the whole CPU copy,
+    // and each draw first uploads the 1 KB pages it reads that the storage does not hold yet (validBits). A 1 MB ring
+    // written 265 KB a frame was copied whole twice a frame (2.6 ms of the render thread).
+    bool lazy = false;
+    std::vector<uint64_t> validBits;
+    void lazyReset(UINT length) { lazy = true; validBits.assign(((length + 1023) / 1024 + 63) / 64, 0); }
+    void lazyInvalidate(UINT offset, UINT size) {
+        if (!size) return;
+        for (UINT p = offset / 1024, last = (offset + size - 1) / 1024; p <= last && p / 64 < validBits.size(); ++p) validBits[p / 64] &= ~(1ull << (p % 64));
+    }
+    inline void ensureValid(GLenum target, UINT lo, UINT hi, const uint8_t* data, UINT length);
     void noteDraw(UINT lo, UINT hi) {
         const uint32_t frame = getD3D9PresentCount();
         if (drawFrame != frame || drawLo >= drawHi) { drawFrame = frame; drawLo = lo; drawHi = hi; return; }
@@ -693,12 +704,18 @@ inline void glesUploadLockedRange(GLenum target, UINT length, UINT offset, UINT 
     static const bool useFlags = [] { const char* e = std::getenv("FO2_GL_BUFFER_FLAGS"); return !(e && e[0] == '0'); }();
     const uint32_t frame = getD3D9PresentCount();
     const bool overlap = use.drawFrame == frame && offset < use.drawHi && offset + size > use.drawLo;
-    if (useFlags && ((lockFlags & D3DLOCK_DISCARD) || ((lockFlags & D3DLOCK_NOOVERWRITE) && (use.orphanFrame != frame || overlap)))) {
-        glBufferData(target, length, data, (usage & D3DUSAGE_DYNAMIC) ? GL_DYNAMIC_DRAW : GL_STATIC_DRAW);
+    static const bool lazyOn = [] { const char* e = std::getenv("FO2_LAZY_BUFFERS"); return !(e && e[0] == '0'); }();
+    const bool lazyOk = lazyOn && useFlags && (usage & D3DUSAGE_DYNAMIC) && length >= 65536 && glesBufferMapping().map && glesBufferMapping().unmap;
+    // A lazy buffer locked without NOOVERWRITE may rewrite bytes that pending draws read: it gets a new storage too (cheap now).
+    if (useFlags && ((lockFlags & D3DLOCK_DISCARD) || ((lockFlags & D3DLOCK_NOOVERWRITE) && (use.orphanFrame != frame || overlap)) ||
+                     (use.lazy && !(lockFlags & D3DLOCK_NOOVERWRITE)))) {
+        if (lazyOk) { glBufferData(target, length, nullptr, GL_DYNAMIC_DRAW); use.lazyReset(length); }
+        else { use.lazy = false; glBufferData(target, length, data, (usage & D3DUSAGE_DYNAMIC) ? GL_DYNAMIC_DRAW : GL_STATIC_DRAW); }
         use.orphanFrame = frame; use.drawFrame = frame; use.drawLo = use.drawHi = 0;
         ++glesOrphanCount();
         return;
     }
+    if (use.lazy) { use.lazyInvalidate(offset, size); return; }   // the draws that read these bytes upload them
     const GlesBufferMapping& gl = glesBufferMapping();
     if (useFlags && (lockFlags & D3DLOCK_NOOVERWRITE) && size && gl.map && gl.unmap) {
         void* dst = gl.map(target, offset, size, GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT | GL_MAP_INVALIDATE_RANGE_BIT);
@@ -708,6 +725,28 @@ inline void glesUploadLockedRange(GLenum target, UINT length, UINT offset, UINT 
         }
     }
     glBufferSubData(target, offset, size, data + offset);
+}
+
+inline uint64_t& glesLazyBytes() { static uint64_t n = 0; return n; }
+// The buffer is bound to target. Uploads the pages of [lo, hi) the storage lacks, unsynchronized: bytes of such a page
+// that pending draws already read are rewritten with the same values.
+inline void GlesBufferUse::ensureValid(GLenum target, UINT lo, UINT hi, const uint8_t* data, UINT length) {
+    if (hi > length) hi = length;
+    if (lo >= hi) return;
+    const GlesBufferMapping& gl = glesBufferMapping();
+    const UINT last = (hi - 1) / 1024;
+    for (UINT p = lo / 1024; p <= last; ++p) {
+        if (p / 64 >= validBits.size()) break;
+        if (validBits[p / 64] >> (p % 64) & 1) continue;
+        UINT q = p;
+        while (q <= last && q / 64 < validBits.size() && !(validBits[q / 64] >> (q % 64) & 1)) { validBits[q / 64] |= 1ull << (q % 64); ++q; }
+        const UINT from = p * 1024, to = std::min<UINT>(q * 1024, length);
+        void* dst = gl.map(target, from, to - from, GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT | GL_MAP_INVALIDATE_RANGE_BIT);
+        if (dst) { std::memcpy(dst, data + from, to - from); gl.unmap(target); }
+        else glBufferSubData(target, from, to - from, data + from);
+        glesLazyBytes() += to - from;
+        p = q;
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -797,7 +836,11 @@ public:
     }
 
     GLuint getVBO() const { ensureGL(); return m_vbo; }
-    void noteDraw(UINT lo, UINT hi) { m_use.noteDraw(lo, std::min(hi, m_length)); }
+    void noteDraw(UINT lo, UINT hi) {
+        m_use.noteDraw(lo, std::min(hi, m_length));
+        if (m_use.lazy && m_vbo) { glBindBuffer(GL_ARRAY_BUFFER, m_vbo); m_use.ensureValid(GL_ARRAY_BUFFER, lo, hi, m_data.data(), m_length); }
+    }
+    bool lazyStorage() const { return m_use.lazy; }
     GLuint getSwizzledColorVBO(UINT stride, UINT colorOffset) {
         ensureGL();
         if (!stride || colorOffset + sizeof(uint32_t) > stride) return m_vbo;
@@ -925,7 +968,10 @@ public:
     }
 
     GLuint getIBO() const { ensureGL(); return m_ibo; }
-    void noteDraw(UINT lo, UINT hi) { m_use.noteDraw(lo, std::min(hi, m_length)); }
+    void noteDraw(UINT lo, UINT hi) {
+        m_use.noteDraw(lo, std::min(hi, m_length));
+        if (m_use.lazy && m_ibo) { glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_ibo); m_use.ensureValid(GL_ELEMENT_ARRAY_BUFFER, lo, hi, m_data.data(), m_length); }
+    }
     D3DFORMAT getFormat() const { return m_format; }
     const uint8_t* getData() const { return m_data.data(); }
     UINT getLength() const { return m_length; }

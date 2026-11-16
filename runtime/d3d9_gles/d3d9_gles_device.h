@@ -6,6 +6,7 @@
 #include "d3d9_gles_shaders.h"
 
 #include <array>
+#include <unordered_set>
 
 namespace d3d9_gles {
 
@@ -247,6 +248,7 @@ private:
     void traceDraw(const char* kind, UINT prims);
     void tracePositions(D3DPRIMITIVETYPE type, UINT start, UINT prims);
     void noteBufferReads(UINT firstVertex, UINT vertices, UINT indexLo, UINT indexHi);
+    INT m_noteBaseVertex = INT_MIN;   // set by indexed draws just before noteBufferReads
     void patchParticleStrip(D3DPRIMITIVETYPE type, UINT start, UINT vertices);
     void noteUnimplemented(const char* what);
     void resetStateDefaults();
@@ -270,6 +272,10 @@ private:
     IDirect3DSurface9GLES* m_currentRenderTarget = nullptr;
     IDirect3DSurface9GLES* m_currentDepthBuffer = nullptr;
     GLuint m_fbo = 0;
+    // One framebuffer object per off-screen target (texture, level, depth buffer): see bindRenderTarget
+    std::unordered_map<uint64_t, GLuint> m_fboCache;
+    uint32_t m_fboCacheGeneration = 0;
+    std::unordered_set<GLuint> m_deadTargets;   // off-screen target textures whose last draw had no program (Clear skips them)
     // Back buffer when the game's render size differs from the screen (another resolution, aspect or a
     // rotated panel): the game draws into this texture and Present scales it onto the window (letterboxed).
     // 0 when the sizes match: the game then draws straight into the window, as before.

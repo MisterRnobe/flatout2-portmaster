@@ -120,6 +120,9 @@ void wake(){if(sleeping.load(std::memory_order_acquire)){std::lock_guard<std::mu
 void push(const Cmd& c,bool urgent=false){
     uint32_t h=head.load(std::memory_order_relaxed);
     while(h-tail.load(std::memory_order_acquire)>=queueSize){wake();std::this_thread::yield();}
+    // The ring (5 MB) is far larger than the caches, so every slot is a miss: the slots a few calls ahead are fetched for
+    // writing now (push was 6% of the game thread in a race). The render thread does the same for reading (loop).
+    {const char* ahead=reinterpret_cast<const char*>(&queue[(h+4)&(queueSize-1)]);__builtin_prefetch(ahead,1,3);__builtin_prefetch(ahead+64,1,3);}
     queue[h&(queueSize-1)]=c;head.store(h+1,std::memory_order_release);
     if(urgent||((h+1)&255u)==0)wake();
 }
@@ -324,7 +327,7 @@ void exec(const Cmd& c){
             surface->UnlockRect();
         }
         break;}
-    case OpStateBlock:if(c.method==4)static_cast<IDirect3DStateBlock9*>(c.obj)->Capture();else static_cast<IDirect3DStateBlock9*>(c.obj)->Apply();break;
+    case OpStateBlock:{static const bool noBlock=[]{const char* e=std::getenv("FO2_EXP_NOBLOCK");return e&&e[0]=='1';}();if(noBlock)break;}if(c.method==4)static_cast<IDirect3DStateBlock9*>(c.obj)->Capture();else static_cast<IDirect3DStateBlock9*>(c.obj)->Apply();break;
     case OpInstancedDraw:{  // a[0..5] DrawIndexedPrimitive arguments, a[6] registers per instance, a[7] instances; p0 registers then data
         auto device=static_cast<IDirect3DDevice9*>(c.obj);const uint32_t count=c.a[6],instances=c.a[7];
         const auto registers=static_cast<const uint16_t*>(c.p0);
@@ -357,9 +360,27 @@ void loop(){
             sleeping.store(false,std::memory_order_relaxed);
             continue;
         }
+        {const char* ahead=reinterpret_cast<const char*>(&queue[(t+4)&(queueSize-1)]);__builtin_prefetch(ahead,0,3);__builtin_prefetch(ahead+64,0,3);}
         const Cmd& c=queue[t&(queueSize-1)];
+        // FO2_RT_PROF=1: wall time of each queued command by kind, to find where this thread blocks in the driver
+        static const bool prof=[]{const char* e=std::getenv("FO2_RT_PROF");return e&&e[0]=='1';}();
+        const uint16_t pop=c.op,pmethod=c.method;
+        const auto p0=prof?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point();
         try{exec(c);}catch(const std::exception& e){NFS_RUNTIME_LOG(ANDROID_LOG_ERROR,"NFSU2","render thread: %s",e.what());}
         tail.store(t+1,std::memory_order_release);
+        if(prof){
+            struct Acc{uint64_t ns=0,n=0,slow=0,slowNs=0;};static Acc acc[16][160];static auto last=std::chrono::steady_clock::now();static uint64_t lastPresents=0;
+            const auto p1=std::chrono::steady_clock::now();const uint64_t d=std::chrono::duration_cast<std::chrono::nanoseconds>(p1-p0).count();
+            Acc& a=acc[pop&15][pmethod<160?pmethod:159];a.ns+=d;++a.n;if(d>300000){++a.slow;a.slowNs+=d;}
+            if(p1-last>std::chrono::seconds(4)){
+                const uint64_t pd=presentsDone.load();const double f=double(pd-lastPresents?pd-lastPresents:1);lastPresents=pd;last=p1;
+                std::string line;char b[160];
+                for(int k=0;k<8;++k){Acc* best=nullptr;int bo=0,bm=0;for(int o=0;o<16;++o)for(int m=0;m<160;++m)if(acc[o][m].ns&&(!best||acc[o][m].ns>best->ns)){best=&acc[o][m];bo=o;bm=m;}
+                    if(!best)break;std::snprintf(b,sizeof b," op%d/m%d %.2fms n=%.0f slow=%.1f(%.2fms);",bo,bm,best->ns/1e6/f,best->n/f,best->slow/f,best->slowNs/1e6/f);line+=b;*best=Acc();}
+                for(auto& row:acc)for(auto& x:row)x=Acc();
+                std::printf("[FO2 RTPROF] %.0f frames, per frame:%s\n",f,line.c_str());
+            }
+        }
         // Producers waiting for the queue to drain (sync calls) are woken by the sync command itself;
         // a plain drain() polls with a short timed wait.
     }

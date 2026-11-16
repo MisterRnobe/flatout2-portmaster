@@ -90,13 +90,15 @@ static void sdlAudioCallback(void*, Uint8* stream, int len) {
     for (unsigned i = 0; i < frames * 2; ++i) peak = std::max(peak, std::fabs(out[i]));
     if ((rendered += frames) >= soundMixer.rate * 2) {
         unsigned playing = 0, voices = 0; size_t bytes = 0; uint64_t stale = 0, played = 0;
+        uint64_t underruns = 0; unsigned queueMs = 0, targetMs = 0;
         {
             std::lock_guard<std::mutex> lock(soundMixer.mutex);
             for (auto& v : soundMixer.voices) if (v) { ++voices; if (v->playing) { ++playing; bytes += v->samples.size(); }
-                stale += v->staleGranules; played += v->playedGranules; v->staleGranules = v->playedGranules = 0; }
+                stale += v->staleGranules; played += v->playedGranules; v->staleGranules = v->playedGranules = 0;
+                if (v->fifoActive) { underruns += v->fifoUnderruns; v->fifoUnderruns = 0; queueMs = unsigned(v->fifoAvail * 1000 / v->frequency); targetMs = unsigned(v->fifoTarget * 1000 / v->frequency); } }
         }
-        NFS_RUNTIME_LOG(ANDROID_LOG_INFO, "NFSU2", "[AS2 AUDIO] peak %.3f, %u voices, %u playing (%zu bytes); stream stretches replayed %llu of %llu",
-                        peak, voices, playing, bytes, (unsigned long long)stale, (unsigned long long)played);
+        NFS_RUNTIME_LOG(ANDROID_LOG_INFO, "NFSU2", "[AS2 AUDIO] peak %.3f, %u voices, %u playing (%zu bytes); stream stretches replayed %llu of %llu; queue %u ms (target %u), %llu dry spells",
+                        peak, voices, playing, bytes, (unsigned long long)stale, (unsigned long long)played, queueMs, targetMs, (unsigned long long)underruns);
         rendered = 0; peak = 0;
     }
 }
@@ -119,8 +121,17 @@ bool startSoundStream() {
     desired.callback = sdlAudioCallback;
     s_sdlAudioDevice = SDL_OpenAudioDevice(nullptr, 0, &desired, &obtained, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
     if (!s_sdlAudioDevice) {
-        NFS_RUNTIME_LOG(ANDROID_LOG_WARN, "NFSU2", "SDL audio device open failed: %s", SDL_GetError());
-        return false;
+        // No sound device (seen on an R50S: "ALSA: Couldn't open audio device"): SDL's dummy driver keeps the callback, and so
+        // the play cursors, running in real time. The game then runs silent instead of losing DirectSound and crashing.
+        NFS_RUNTIME_LOG(ANDROID_LOG_WARN, "NFSU2", "SDL audio device open failed: %s; trying the silent (dummy) output", SDL_GetError());
+        SDL_QuitSubSystem(SDL_INIT_AUDIO);
+        SDL_setenv("SDL_AUDIODRIVER", "dummy", 1);
+        if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) s_sdlAudioDevice = SDL_OpenAudioDevice(nullptr, 0, &desired, &obtained, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
+        if (!s_sdlAudioDevice) {
+            NFS_RUNTIME_LOG(ANDROID_LOG_WARN, "NFSU2", "silent output failed too: %s", SDL_GetError());
+            return false;
+        }
+        NFS_RUNTIME_LOG(ANDROID_LOG_WARN, "NFSU2", "NO SOUND: the game runs with a silent output");
     }
     soundMixer.rate = unsigned(obtained.freq);
     SDL_PauseAudioDevice(s_sdlAudioDevice, 0);
@@ -376,11 +387,11 @@ void soundDispatchBody(){
         fmodFirstLook(0);
         object.locked=true;object.lockOffset=offset;object.lockBytes=length;
         write32(arg(3),object.guestSamples+offset);write32(arg(4),first);if(arg(5))write32(arg(5),second?object.guestSamples:0);if(arg(6))write32(arg(6),second);ret(0,8);return;}
-    case 12:{if(arg(1)||arg(2)||arg(3)&~1u){ret(0x80070057,4);return;}std::lock_guard<std::mutex> lock(soundMixer.mutex);voice->loop=arg(3)&1;voice->playing=true;
+    case 12:{if(arg(1)||arg(2)||arg(3)&~1u){ret(0x80070057,4);return;}std::lock_guard<std::mutex> lock(soundMixer.mutex);voice->loop=arg(3)&1;if(!voice->playing)voice->fifoReset();voice->playing=true;
         unsigned active=0;for(auto& slot:soundMixer.voices)if(slot&&slot->playing)++active;
         AUDIO_LOG("Play #%u: bytes=%u loop=%u volume=%d pan=%d frequency=%u, %u voices playing",self,unsigned(voice->samples.size()),unsigned(voice->loop),int(object.volume),int(object.pan),voice->frequency,active);
         ret(0,4);return;}
-    case 13:{if(arg(1)>=voice->samples.size()||arg(1)%voice->block()){ret(0x80070057,2);return;}std::lock_guard<std::mutex> lock(soundMixer.mutex);voice->position=arg(1)/voice->block();ret(0,2);return;}
+    case 13:{if(arg(1)>=voice->samples.size()||arg(1)%voice->block()){ret(0x80070057,2);return;}std::lock_guard<std::mutex> lock(soundMixer.mutex);voice->position=arg(1)/voice->block();voice->fifoReset();ret(0,2);return;}
     case 14:{if(!(object.flags&1)){ret(0x80070057,2);return;}std::lock_guard<std::mutex> lock(soundMixer.mutex);ret(soundFormat(arg(1),*voice)?0:soundBadFormat,2);return;}
     case 15:case 16:{int32_t value=int32_t(arg(1));if(value < -10000||value>(method==15?0:10000)){ret(0x80070057,2);return;}
         std::lock_guard<std::mutex> lock(soundMixer.mutex);if(method==15)object.volume=arg(1);else object.pan=arg(1);
@@ -395,7 +406,7 @@ void soundDispatchBody(){
         }
         ret(0,2);return;}
     case 17:{uint32_t frequency=arg(1)?arg(1):voice->rate;if(frequency<100||frequency>200000){ret(0x80070057,2);return;}std::lock_guard<std::mutex> lock(soundMixer.mutex);voice->frequency=frequency;ret(0,2);return;}
-    case 18:{std::lock_guard<std::mutex> lock(soundMixer.mutex);voice->playing=false;AUDIO_LOG("Stop #%u: bytes=%u",self,unsigned(voice->samples.size()));ret(0,1);return;}
+    case 18:{std::lock_guard<std::mutex> lock(soundMixer.mutex);voice->playing=false;voice->fifoReset();AUDIO_LOG("Stop #%u: bytes=%u",self,unsigned(voice->samples.size()));ret(0,1);return;}
     case 19:{uint32_t bytes=uint32_t(voice->samples.size()),first=std::min(object.lockBytes,bytes-object.lockOffset),second=object.lockBytes-first;
         if(!object.locked||arg(1)!=object.guestSamples+object.lockOffset||arg(2)!=first||arg(3)!=(second?object.guestSamples:0)||arg(4)!=second){ret(0x80070057,5);return;}
         // Publish only what the guest locked. Copying the whole ring under the
@@ -404,7 +415,8 @@ void soundDispatchBody(){
         {std::lock_guard<std::mutex> lock(soundMixer.mutex);
             std::memcpy(voice->samples.data()+object.lockOffset,ptr(object.guestSamples+object.lockOffset,first),first);
             if(second)std::memcpy(voice->samples.data(),ptr(object.guestSamples,second),second);
-            if(first<bytes||voice->playing){voice->markWritten(object.lockOffset,first);voice->markWritten(0,second);}}
+            if(first<bytes||voice->playing){voice->markWritten(object.lockOffset,first);voice->markWritten(0,second);}
+            if(voice->playing&&voice->loop&&PcmVoice::fifoEnabled()){voice->fifoPush(voice->samples.data()+object.lockOffset,first);if(second)voice->fifoPush(voice->samples.data(),second);}}
         auto published=std::chrono::steady_clock::now();
         if(object.lastPublish!=std::chrono::steady_clock::time_point{})object.maxPublishGap=std::max(object.maxPublishGap,
             std::chrono::duration_cast<std::chrono::microseconds>(published-object.lastPublish));

@@ -163,8 +163,11 @@ inline void BindTexture(GLenum target, GLuint tex) {
     else if (target == GL_TEXTURE_CUBE_MAP) { if (s.texValidCube[u] && s.texCube[u] == tex) return; s.texCube[u] = tex; s.texValidCube[u] = true; }
     GLSC_ISSUE(); (glBindTexture)(target, tex);
 }
+// Bumped whenever a texture or renderbuffer is deleted: the device's per-target framebuffer cache is rebuilt then
+inline uint32_t& attachmentGeneration() { static uint32_t g = 0; return g; }
 inline void DeleteTextures(GLsizei n, const GLuint* t) {
     State& s = S();
+    ++attachmentGeneration();
     for (GLsizei i = 0; i < n; ++i) for (int u = 0; u < 16; ++u) {
         if (s.tex2D[u] == t[i]) s.texValid2D[u] = false;
         if (s.texCube[u] == t[i]) s.texValidCube[u] = false;
@@ -189,7 +192,7 @@ inline void DeleteBuffers(GLsizei n, const GLuint* b) {
 inline void BindFramebuffer(GLenum target, GLuint fb) { GLSC_REQ(); State& s = S(); if (s.fbValid && s.framebuffer == fb) return; s.framebuffer = fb; s.fbValid = true; GLSC_ISSUE(); (glBindFramebuffer)(target, fb); }
 inline void DeleteFramebuffers(GLsizei n, const GLuint* f) { State& s = S(); for (GLsizei i = 0; i < n; ++i) if (s.framebuffer == f[i]) s.fbValid = false; (glDeleteFramebuffers)(n, f); }
 inline void BindRenderbuffer(GLenum target, GLuint rb) { GLSC_REQ(); State& s = S(); if (s.rbValid && s.renderbuffer == rb) return; s.renderbuffer = rb; s.rbValid = true; GLSC_ISSUE(); (glBindRenderbuffer)(target, rb); }
-inline void DeleteRenderbuffers(GLsizei n, const GLuint* r) { State& s = S(); for (GLsizei i = 0; i < n; ++i) if (s.renderbuffer == r[i]) s.rbValid = false; (glDeleteRenderbuffers)(n, r); }
+inline void DeleteRenderbuffers(GLsizei n, const GLuint* r) { State& s = S(); ++attachmentGeneration(); for (GLsizei i = 0; i < n; ++i) if (s.renderbuffer == r[i]) s.rbValid = false; (glDeleteRenderbuffers)(n, r); }
 inline void UseProgram(GLuint p) { GLSC_REQ(); State& s = S(); if (s.programValid && s.program == p) return; s.program = p; s.programValid = true; GLSC_ISSUE(); (glUseProgram)(p); }
 inline void DeleteProgram(GLuint p) { State& s = S(); if (s.program == p) s.programValid = false; (glDeleteProgram)(p); }
 inline void EnableVertexAttribArray(GLuint i) { GLSC_REQ(); State& s = S(); if (i < 16 && s.attribEnabled[i] == 1) return; if (i < 16) s.attribEnabled[i] = 1; GLSC_ISSUE(); (glEnableVertexAttribArray)(i); }

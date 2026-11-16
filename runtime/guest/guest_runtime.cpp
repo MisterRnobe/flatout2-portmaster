@@ -143,8 +143,10 @@ std::vector<uint32_t> freeThreadEntries;
 // in v1.0 to 0x007263C7 in v1.2). With the v1.0 address on v1.2 the thread never ran free: it took turns with the
 // game thread under the machine, which then waited ~6 ms per frame for it (~25 fps instead of ~27) and the
 // sound thread was starved.
-// Alien Shooter 2: no thread is known to be safe to run free yet; every guest thread takes turns.
-#define NFS_SOUND_THREAD_ENTRY ""
+// FlatOut 2: FMOD 3.75's mixer thread (0x61DB85) and stream thread (0x617A65). Under the machine they were starved by the
+// game thread and starved it in turn: on an RK3326 with music, 104 dry spells of the audio queue and 60 frames over 50 ms
+// in one race, against 2 and 1 in parallel. NFSU2_PARALLEL_THREADS= (empty) puts them back under the machine.
+#define NFS_SOUND_THREAD_ENTRY "61db85,617a65"
 std::unique_ptr<GuestMemory> memory;
 std::unique_ptr<GuestHeaps> heaps;
 // The guest machine lock: FIFO by ticket and recursive per thread, with the
@@ -375,7 +377,9 @@ void checkGuestProgress() {
         if(bootDeadline!=std::chrono::steady_clock::time_point::max()&&now>bootDeadline)throw GuestStop("CRT bring-up time budget reached at "+hex(g_cur_func));
         // Time slicing only matters while threads take turns; parallel guest code holds no machine.
         if(now>=nextYield&&(!parallelGuest||machine.heldByMe())){
-            if(!currentTrace().holdsLocks()){
+            // FO2_YIELD_WITH_LOCKS=1 (test): hand the machine over even while this thread holds a guest critical section
+            static const bool yieldWithLocks=[]{const char* e=std::getenv("FO2_YIELD_WITH_LOCKS");return e&&e[0]=='1';}();
+            if(yieldWithLocks||!currentTrace().holdsLocks()){
                 if(machine.hasWaiters())yieldGuestMachine();
                 nextYield=std::chrono::steady_clock::now()+std::chrono::microseconds(500);
             }
@@ -1381,6 +1385,33 @@ static void fo2CameraScriptRead(){
     done+=count;g_eax=uint32_t(count);
     static bool told=false;if(!told){told=true;std::printf("[FO2] camera 4 added to the cars' camera files\n");}
 }
+// 0x41A7F0 (eax = a car's engine sound state, [esp+4] = milliseconds since its last update) smooths the engine speed (+0x64),
+// the load (+0x68) and a start-up wobble (+0xA0, +0xA4) from one update to the next, and divides by that time. A state value
+// that is not finite once stays so for the whole race: every band of the engine sound is then played at volume 0 (user
+// report: the player's car silent in about one race in three, its jet flames missing too). FO2_ENGINE_GUARD: 1 (default) a
+// time step that is not positive becomes 1 ms and non-finite state is put back to rest; 2 only logs; 0 off.
+static void fo2EngineSoundGuard(){
+    static const int mode=[]{const char* e=std::getenv("FO2_ENGINE_GUARD");return e?std::atoi(e):1;}();
+    if(!mode)return;
+    const uint32_t o=g_eax;
+    const auto rf=[](uint32_t va){uint32_t raw=read32(va);float v;std::memcpy(&v,&raw,4);return v;};
+    const auto wf=[](uint32_t va,float v){uint32_t raw;std::memcpy(&raw,&v,4);write32(va,raw);};
+    static int logged=0;
+    const float dt=rf(g_esp+4);
+    if(!(dt>0.0f)){
+        if(logged<12){++logged;NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU2","[FO2 ENGINE] state %08x: time step %g ms%s",o,double(dt),mode==1?", 1 ms used":"");}
+        if(mode==1)wf(g_esp+4,1.0f);
+    }
+    for(uint32_t at=0x60;at<0xC4;at+=4){
+        const float v=rf(o+at);
+        if(std::isfinite(v))continue;
+        if(logged<12){++logged;NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU2","[FO2 ENGINE] state %08x +%02x = %g (target speed %g, speed %g, load %g, wobble %g %g, time step %g)%s",
+            o,at,double(v),double(rf(o+0x24)),double(rf(o+0x64)),double(rf(o+0x68)),double(rf(o+0xA0)),double(rf(o+0xA4)),double(dt),mode==1?": repaired":"");}
+        if(mode!=1)continue;
+        if(at==0x64){float t=rf(o+0x24);const float lo=rf(o+0x34),hi=rf(o+0x38);if(!std::isfinite(t))t=lo;if(std::isfinite(lo)&&t<lo)t=lo;if(std::isfinite(hi)&&t>hi)t=hi;wf(o+at,std::isfinite(t)?t:0.0f);}
+        else wf(o+at,0.0f);
+    }
+}
 extern "C" void recomp_hook(uint32_t va){
     if(va==0x0056C850u){
         lastRacePhysics.store(std::chrono::steady_clock::now().time_since_epoch().count(),std::memory_order_relaxed);physicsSteps.fetch_add(1,std::memory_order_relaxed);
@@ -1402,6 +1433,7 @@ extern "C" void recomp_hook(uint32_t va){
         const char* e=std::getenv("FO2_VIDEOS");
         if(!(e?e[0]=='1':fo2_video_available()!=0))write32(0x8DA61Cu,0);
     }
+    else if(va==0x0041A7F0u)fo2EngineSoundGuard();
     else if(va==0x004C8320u)fo2_video_close(g_esi);   // the player (esi) closes its streams
     else if(va==0x00524276u)fo2CameraScriptRead();
     // 0x4C8F00 (player*, file name, flags): the Zoom release's logo takes the place of the first boot movie.

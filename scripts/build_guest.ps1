@@ -15,7 +15,9 @@ param(
     # 0x42B440 tree (recomp_0002.c) are in them and take most of a race frame, so -O2 there too
     [string]$BigOpt = '-O2',
     # without the local x87 window (NFS_X87_LW): the annotations stay inert, every function uses the global stack
-    [switch]$NoLW
+    [switch]$NoLW,
+    # more compiler flags, e.g. -ffunction-sections for a link ordered by build_host.ps1 -OrderFile
+    [string[]]$ExtraFlags = @()
 )
 $ErrorActionPreference = 'Stop'
 New-Item -ItemType Directory -Force $Out | Out-Null
@@ -29,6 +31,7 @@ $common = @('-target', 'aarch64-linux-gnu.2.28', '-mcpu=cortex_a53', '-fno-pie',
     # (needs $Gen/nfs_lw.h and the annotated call sites: run lw.ps1 after each lift)
     '-DNFS_X87_LOCAL', '-DNFS_X87_LW',
     "-I$Pcrecomp\runtime\recomp32", "-I$Gen")
+$common += $ExtraFlags
 if ($NoLW) { $common = @($common | Where-Object { $_ -ne '-DNFS_X87_LW' }) }
 
 # FlatOut2.exe (recomp_*) and d3dx9_30.dll (d3dx_recomp_*)

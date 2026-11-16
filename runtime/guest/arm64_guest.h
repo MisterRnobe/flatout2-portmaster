@@ -17,7 +17,10 @@ extern int nfs_android_resolution(void);
 #undef RECOMP_ENTER
 // g_cur_func (diagnostics only: crash and import logs) is set on entry only with NFS_TRACK_CUR_FUNC: a
 // constant materialisation and a store on every call otherwise.
-#ifdef NFS_TRACK_CUR_FUNC
+#if defined(NFS_COUNT_CALLS)   // diagnostics build: lifted calls per frame, printed with the PERF lines
+extern unsigned long long g_nfs_call_count;
+#define NFS_SET_CUR_FUNC(va) (++g_nfs_call_count)
+#elif defined(NFS_TRACK_CUR_FUNC)
 #define NFS_SET_CUR_FUNC(va) (g_cur_func=(va))
 #else
 #define NFS_SET_CUR_FUNC(va) ((void)0)

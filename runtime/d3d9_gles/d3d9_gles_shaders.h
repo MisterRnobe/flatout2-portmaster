@@ -153,6 +153,11 @@ struct ProgramBinaryCache {
         ++loaded;
         return true;
     }
+    // Programs that cannot link (FlatOut 2's bloom passes with the fixed-function vertex shader): remembered as an empty
+    // <key>.fail file, so later runs do not link them again (19 failed links, 13 s at each race start on an RK3326).
+    bool knownFailure(uint64_t key) const { FILE* f = std::fopen((path(key) + ".fail").c_str(), "rb"); if (!f) return false; std::fclose(f); return true; }
+    void saveFailure(uint64_t key) { FILE* f = std::fopen((path(key) + ".fail").c_str(), "wb"); if (f) { std::fclose(f); ++failuresSaved; } }
+    uint32_t failuresSkipped = 0, failuresSaved = 0;
     void save(GLuint prog, uint64_t key) {
         GLint len = 0;
         glGetProgramiv(prog, 0x8741 /* GL_PROGRAM_BINARY_LENGTH_OES */, &len);
@@ -220,7 +225,23 @@ inline std::string withMissingVaryings(const std::string& vsSrc, const std::stri
     return vsSrc.substr(0, mainAt) + decls + vsSrc.substr(mainAt, lastBrace - mainAt) + inits + vsSrc.substr(lastBrace);
 }
 
-inline bool compileGLShader(GLenum type, const std::string& src, GLuint& out, const char* what) {
+// Shaders of the game's draws are compiled only when a program really has to be linked (FO2_LAZY_SHADERS=0: at once).
+// A program found in the binary cache needs no compiled shader, and compiling took up to 0.8 s on an RK3326 in the
+// middle of a race, every session, for every shader first used there.
+struct PendingShader { std::string what; };
+inline std::unordered_map<GLuint, PendingShader>& pendingShaders() { static std::unordered_map<GLuint, PendingShader> m; return m; }
+inline bool lazyShaders() { static const bool on = [] { const char* e = std::getenv("FO2_LAZY_SHADERS"); return !(e && e[0] == '0'); }(); return on; }
+inline bool ensureShaderCompiled(GLuint sh);
+inline bool compileGLShader(GLenum type, const std::string& src, GLuint& out, const char* what, bool lazy = false) {
+    if (lazy && lazyShaders()) {
+        GLuint sh = glCreateShader(type);
+        const char* p = src.c_str();
+        glShaderSource(sh, 1, &p, nullptr);
+        shaderSourceHashes()[sh] = fnv64(src.data(), src.size(), type);
+        pendingShaders()[sh] = PendingShader{what};
+        out = sh;
+        return true;
+    }
     HitchTimer hitch(0);
     GLuint sh = glCreateShader(type);
     const char* p = src.c_str();
@@ -239,6 +260,23 @@ inline bool compileGLShader(GLenum type, const std::string& src, GLuint& out, co
     shaderSourceHashes()[sh] = fnv64(src.data(), src.size(), type);
     out = sh;
     return true;
+}
+// A shader created lazily: compiled now. False when it does not compile (logged once; the shader stays, unusable).
+inline bool ensureShaderCompiled(GLuint sh) {
+    auto& pending = pendingShaders();
+    auto it = pending.find(sh);
+    if (it == pending.end()) { GLint ok = 0; glGetShaderiv(sh, GL_COMPILE_STATUS, &ok); return ok != 0; }
+    HitchTimer hitch(0);
+    glCompileShader(sh);
+    GLint ok = 0;
+    glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[2048]{};
+        glGetShaderInfoLog(sh, sizeof(log), nullptr, log);
+        std::fprintf(stderr, "[D3D9 GLES] %s compile failed: %s\n", it->second.what.c_str(), log);
+    }
+    pending.erase(it);
+    return ok != 0;
 }
 
 // Alpha test, evaluated in 8-bit space like D3D9 (ALPHAREF is 0..255).
@@ -259,6 +297,9 @@ inline const char* alphaTestGLSL() {
 // D3D9 fixed-function fog applied after the pixel shader (ps < 3.0). PS variant key bits 16..18:
 enum FogKey : uint32_t { kFogNone = 0, kFogVertex = 1, kFogLinear = 2, kFogExp = 3, kFogExp2 = 4 };
 constexpr uint32_t kFogShift = 16;
+// PS variant key bit 20: the alpha test is on. Without it the shader has no discard at all, so a tile-based GPU
+// can write depth early and drop hidden pixels before shading them (most draws are opaque).
+constexpr uint32_t kAlphaTestBit = 1u << 20;
 inline std::string fogGLSL(uint32_t fogMode) {
     if (fogMode == kFogNone) return "";
     std::string s = "\t{\n";
@@ -546,7 +587,7 @@ private:
                 src.insert(precisionPos + std::strlen(prec), std::string("\nuniform vec4 u_alphaTest;\n") + (fogMode ? fogDeclsGLSL() : ""));
             }
             size_t lastBrace = src.rfind('}');
-            if (lastBrace != std::string::npos) src.insert(lastBrace, fogGLSL(fogMode) + alphaTestGLSL());
+            if (lastBrace != std::string::npos) src.insert(lastBrace, fogGLSL(fogMode) + ((key & kAlphaTestBit) ? alphaTestGLSL() : ""));
             // oDepth (Alien Shooter 2's pseudo-3D ground): GLSL ES 1.00 needs GL_EXT_frag_depth for it;
             // without the extension the depth write is dropped (the shader still draws its colour).
             if (src.find("gl_FragDepth") != std::string::npos) {
@@ -570,7 +611,7 @@ private:
         char what[64];
         std::snprintf(what, sizeof(what), "%s %u.x variant 0x%X", m_type == GL_VERTEX_SHADER ? "VS" : "PS",
                       majorVersion(), key);
-        if (!compileGLShader(m_type, src, v.glShader, what)) return;
+        if (!compileGLShader(m_type, src, v.glShader, what, true)) return;
         v.valid = true;
 
         static const bool s_dump = std::getenv("NFSU2_DUMP_SHADERS") != nullptr;
@@ -735,7 +776,7 @@ inline std::string mojoVaryings(uint32_t mask) {
 
 // mojoMask: 0 after the FFP vertex shader; kMojoDiffuse... | 0x80000000 after a game (MojoShader) vertex shader.
 inline std::string ffpPixelSource(const FFPStage* stages, int count, bool specularEnable, uint32_t fogMode,
-                                  uint32_t mojoMask = 0) {
+                                  uint32_t mojoMask = 0, bool alphaTest = true) {
     std::string s =
         "#version 100\n"
         "precision mediump float;\n"
@@ -788,7 +829,7 @@ inline std::string ffpPixelSource(const FFPStage* stages, int count, bool specul
     if (specularEnable) s += "    cur.rgb = clamp(cur.rgb + v_specular.rgb, 0.0, 1.0);\n";
     s += "    gl_FragColor = cur;\n";
     s += fogGLSL(fogMode);
-    s += alphaTestGLSL();
+    if (alphaTest) s += alphaTestGLSL();
     s += "}\n";
     return s;
 }
@@ -869,7 +910,7 @@ public:
         auto it = m_ffpVS.find(key);
         if (it != m_ffpVS.end()) return it->second;
         GLuint sh = 0;
-        compileGLShader(GL_VERTEX_SHADER, ffpVertexSource(key), sh, "FFP VS");
+        compileGLShader(GL_VERTEX_SHADER, ffpVertexSource(key), sh, "FFP VS", true);
         m_ffpVS[key] = sh;
         return sh;
     }
@@ -878,7 +919,7 @@ public:
         auto it = m_ffpPS.find(src);
         if (it != m_ffpPS.end()) return it->second;
         GLuint sh = 0;
-        compileGLShader(GL_FRAGMENT_SHADER, src, sh, "FFP PS");
+        compileGLShader(GL_FRAGMENT_SHADER, src, sh, "FFP PS", true);
         m_ffpPS[src] = sh;
         return sh;
     }
@@ -922,16 +963,22 @@ public:
                 else cacheKey ^= 0x46465000ull;
             }
         }
+        static const bool fixVaryings = [] { const char* e = std::getenv("FO2_FIX_VARYINGS"); return e && e[0] == '1'; }();
         GLint ok = 0;
-        if (cacheKey && cache.tryLoad(prog, cacheKey)) ok = 1;
+        bool knownFailure = false;
+        if (cacheKey && !fixVaryings && cache.knownFailure(cacheKey)) { knownFailure = true; ++cache.failuresSkipped; }
+        else if (cacheKey && cache.tryLoad(prog, cacheKey)) ok = 1;
         else {
-            glLinkProgram(prog);
-            glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+            const bool vsOk = ensureShaderCompiled(vsHandle), psOk = ensureShaderCompiled(psHandle);
+            if (vsOk && psOk) {
+                glLinkProgram(prog);
+                glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+            }
             if (ok && cacheKey) cache.save(prog, cacheKey);
+            else if (!ok && cacheKey && !fixVaryings) cache.saveFailure(cacheKey);
         }
         // Off by default: in FlatOut 2 these programs are its bloom passes (~8 ms a race frame), and the user
         // prefers the picture and the speed without them. FO2_FIX_VARYINGS=1 links and draws them.
-        static const bool fixVaryings = [] { const char* e = std::getenv("FO2_FIX_VARYINGS"); return e && e[0] == '1'; }();
         if (!ok && fixVaryings) {
             // A pixel shader reading interpolators its vertex shader does not write: link once more with a
             // vertex shader that declares them, set to zero (withMissingVaryings). Kept for the program's life.
@@ -956,6 +1003,7 @@ public:
                 if (ok) std::fprintf(stderr, "[D3D9 GLES] Program linked with the pixel shader's missing varyings added to its vertex shader\n");
             }
         }
+        if (!ok && knownFailure) { glDeleteProgram(prog); return nullptr; }
         if (!ok) {
             char log[2048]{};
             glGetProgramInfoLog(prog, sizeof(log), nullptr, log);
