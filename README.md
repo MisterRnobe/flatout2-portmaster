@@ -6,6 +6,8 @@ FlatOut 2 (PC) statically recompiled to native ARM64 Linux, as a PortMaster-styl
 
 **Transparency:** this port was developed entirely with Claude, Anthropic's AI, which wrote the code. My own part was testing it on real consoles, analysing the results and proposing improvements.
 
+> **New in 2.0.0:** [LAN multiplayer](#lan-multiplayer) between consoles and with a Windows PC, and native gamepad support with **analog steering** (progressive d-pad steering on consoles without a stick). [Download it from the Releases](https://github.com/badcats72/flatout2-portmaster/releases/latest).
+
 <!-- SCREENSHOTS: one per console, same place in the game, FPS counter visible -->
 
 | RG34XX-SP | RG351P | GKD Pixel II |
@@ -22,11 +24,11 @@ Click an image to see it at its real resolution.
 | Anbernic RG351P | RK3326 | Cortex-A35 | Mali-G31 MP2 | dArkOS | 480x320 | 33 | 20 | 18 |
 | GKD Pixel II | RK3326S | Cortex-A35 | Mali-G31 2EE | ROCKNIX | 640x480 | 36 | 23 | 17 |
 
-Measured with the port's own FPS counter by playing one lap on the same track with the same car, in similar driving, with busy moments and quiet ones. These are the figures shown on the screenshots above: expect some variation between races.
+Measured with the port's own FPS counter by playing one lap on the same track with the same car, in similar driving, with busy moments and quiet ones. These are the figures shown on the screenshots above (taken with 1.1.0; 2.0.0 runs at the same speed): expect some variation between races.
 
-### Version 1.0.0 against 1.1.0
+### Version 1.0.0 against 1.1.0 and 2.0.0
 
-Same track, same car, one lap each time.
+Same track, same car, one lap each time. Version 2.0.0 adds LAN multiplayer and the gamepad on top of 1.1.0, with the same performance.
 
 | Console | Average FPS | Min | 1% low |
 |---|---|---|---|
@@ -34,12 +36,12 @@ Same track, same car, one lap each time.
 | RG351P | 26 → 33 | 15 → 20 | 15 → 18 |
 | GKD Pixel II | 25 → 36 | 12 → 23 | 12 → 17 |
 
-Version 1.0.0 was limited to 30 FPS on the RG351P and the GKD Pixel II; version 1.1.0 is not. The two RG351P runs were made on two consoles of the same model.
+Version 1.0.0 was limited to 30 FPS on the RG351P and the GKD Pixel II; versions 1.1.0 and 2.0.0 are not. The two RG351P runs were made on two consoles of the same model.
 
 | | RG34XX-SP | RG351P | GKD Pixel II |
 |---|---|---|---|
 | 1.0.0 | <a href="images/rg34xx-sp.png"><img src="images/rg34xx-sp.png" height="160" alt="RG34XX-SP, 1.0.0"></a> | <a href="images/rg351p.png"><img src="images/rg351p.png" height="160" alt="RG351P, 1.0.0"></a> | <a href="images/gkd-pixel2.png"><img src="images/gkd-pixel2.png" height="160" alt="GKD Pixel II, 1.0.0"></a> |
-| 1.1.0 | <a href="images/rg34xx-sp-v1.1.0.png"><img src="images/rg34xx-sp-v1.1.0.png" height="160" alt="RG34XX-SP, 1.1.0"></a> | <a href="images/rg351p-v1.1.0.png"><img src="images/rg351p-v1.1.0.png" height="160" alt="RG351P, 1.1.0"></a> | <a href="images/gkd-pixel2-v1.1.0.png"><img src="images/gkd-pixel2-v1.1.0.png" height="160" alt="GKD Pixel II, 1.1.0"></a> |
+| 1.1.0 / 2.0.0 | <a href="images/rg34xx-sp-v1.1.0.png"><img src="images/rg34xx-sp-v1.1.0.png" height="160" alt="RG34XX-SP, 1.1.0"></a> | <a href="images/rg351p-v1.1.0.png"><img src="images/rg351p-v1.1.0.png" height="160" alt="RG351P, 1.1.0"></a> | <a href="images/gkd-pixel2-v1.1.0.png"><img src="images/gkd-pixel2-v1.1.0.png" height="160" alt="GKD Pixel II, 1.1.0"></a> |
 
 Other consoles are not tested. The launcher tries to adapt to the screen and video driver of an unknown console, but it may need work: please open an issue with your console, your OS and `ports/flatout2/log.txt`.
 
