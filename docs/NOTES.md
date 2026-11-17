@@ -558,7 +558,7 @@ as on Windows, and logged with the last operations on that section (csNote / csD
 resolver, I, D, U). Installed on the RG34XX-SP (MD5 9192018b...). The GKD still has 9acebea6... (threads under the machine): it was
 off the network when this build was ready. To send a build there: gzip it (30 MB instead of 95) and `scp -l 6000`.
 
-**Second RG351P (dArkOS, Debian 13, 2026-11-16; the first one no longer powers on).** The user copied the old
+**Second RG351P (dArkOS, Debian 13; the first one no longer powers on).** The user copied the old
 "RG351P - pret a jouer" folder there (CD archives with the GOG / Zoom exe, a build from before v1.0.0, kept as fo2.aarch64.old; old
 launcher kept as flatout2/launcher.old). Installed: build 9192018b... and the current launcher. Automatic races, music at 80%, 170 s
 (session scripts r351.ps1 / run351.sh / consum.sh): old build at the 30 FPS cap 26.3 FPS, 65 frames over 50 ms in the race (its
@@ -590,6 +590,83 @@ three consoles: RG34XX-SP, GKD Pixel II, second RG351P. Control races with music
 `port/FlatOut 2.sh` defaults to 60 FPS on every console (FO2_CAP=30 in fo2.env for a steady 30; a copy named "... 30 FPS" still
 caps at 30), pushed to the three consoles (previous one kept as flatout2/launcher.prev). The release package, README and BUILD.md
 are still those of v1.0.0 (two launchers, no PGO step, old numbers).
+
+**v1.1.0 published, 2026-11-16.** The user's runs, one lap, same track and car as for v1.0.0 (average / minimum / 1% low): RG34XX-SP
+52 / 40 / 20 (was 39 / 28 / 23), RG351P 33 / 20 / 18 (was 26 / 15 / 15, on the other console of that model), GKD Pixel II 36 / 23 / 17
+(was 25 / 12 / 12). Repository commit 6d009c2 (README with the before / after table and screenshots, BUILD.md with the PGO steps,
+sources), release v1.1.0 with FlatOut2-ARM64-port.zip (MD5 ddf4c158f280172178bbd4c56cf1f195, checked after download: one launcher,
+binary 4cbb1e7d...), and a reply on issue 1. The published docs/NOTES.md has the CD-exe section and the LAN addresses taken out.
+
+**LAN works (2026-11-17).** The crash of a console receiving a LAN packet (0x5070C0 reading [ebp+0x1128] with ebp = 0) was the
+runtime's own: a WSARecvFrom left pending (WSA_IO_PENDING) kept the game's WSABUF array, "received" and "flags" pointers, all on
+the network thread's stack, and when the packet came wsaov::receive wrote 0 through the flags pointer, by then a saved ebp. The
+array is now copied at the call and nothing is written through those pointers afterwards (Windows does not write them either once
+the call has returned pending). Found with a crash report now built into the runtime (nfsInstallCrashHandler, guest_runtime.cpp:
+signal, faulting address, guest registers, host call chain by frame pointers, resolved with the binary's symbols: the chain was
+sub_005070C0 <- sub_004E58B0 <- callGuest <- guestThreadEntry; the probes put around the packet handler 0x506160 never ran, so the
+fault was before it). First LAN race, user's two consoles (RG34XX-SP hosting, RG351P joining, FO2_LAN=1 in fo2.env): both into the
+race, position 2/2, packets both ways (22 to 109 bytes to the other console's port 23756, broadcasts of the host to 23757),
+RG34XX-SP 59.5 FPS and RG351P 52.7 FPS on the grid with the cars still (no driving measured yet), no crash. The RG351P runs the CD
+data, the RG34XX-SP the GOG / Zoom data: the boot logo screen differs, both sessions joined anyway. The LAN probes (FO2_LAN_TRACE,
+RECOMP_HOOK lines added by hand to work/gen/recomp_0015.c) are still in the build. Still to do: a whole race driven on both,
+leaving and starting a second race, the default (FO2_LAN is off unless set), then take the probes out.
+
+**LAN with four consoles (2026-11-17).** A whole race was finished by three (RG34XX-SP hosting, the second RG351P, the GKD Pixel
+II). The first RG351P is killed at every LAN race start by the kernel's OOM killer (dmesg: fo2.aarch64 anon-rss 452 MB), not by a
+crash of the port: none of the dArkOS installs has swap on (zram-swap.service installed but disabled), and on that console
+EmulationStation, which stays resident while a port runs, holds 342 MB (131 MB on the other RG351P). Not changed: enabling zram is the
+user's choice. Disconnections: from the PC, pings to the two USB-Realtek consoles (r8188eu) reach 300-600 ms while the game runs,
+against 13-15 ms to the others; the launcher now turns the Wi-Fi's power saving off while a LAN game runs (iw, and the Realtek
+module's rtw_power_mgnt, both put back on exit; FO2_WIFI_AWAKE=0 leaves them), and the runtime logs every 5 s, per peer, the packets
+received and the longest silence ([FO2 NET] lines). Pause in a LAN race: the game keeps running, so the port's pad mapping stays on
+"race" and the confirm button sends accelerate: the quit confirmation cannot be validated. Needs the game's "menu open" flag.
+
+**LAN with a PC (2026-11-17).** The Windows game (GOG / Zoom FlatOut2.exe, the same MD5 as the lifted one) hosted a session that
+the four consoles joined. It did not work at first, with the firewall rule allowed: the PC had a Radmin VPN adapter with interface
+metric 1 (Ethernet 25), so its LAN traffic and broadcasts went to the VPN; with Radmin VPN quit, PC and consoles see each other.
+The second RG351P's [FO2 NET] lines then showed about 24 packets a second from the PC and from each console, longest silences
+67-157 ms, no send error. The zram swap the user enabled on both RG351P let the first one race (it was OOM-killed before).
+
+**Pause menu in a LAN race.** The user's clue: on "No", the confirm button moved to "Yes" and quit; on "Yes" it did nothing:
+the button sent the race mapping's accelerate (Up). Found by memory snapshots: the scratchpad's `nanscan <pid> snap <va> <bytes>
+<file>` (no stop) saved .data (0x681000, 0x282BE4 bytes) every 0.75 s of a single race whose automatic presses opened and closed
+the pause twice (session menusnap.sh); 18 dwords hold one value whenever the menu is open and another whenever it is closed, and
+switch exactly with it: 0x8DA4EC, 0x8DA4F8, 0x8DA514 (1 / 0), 0x8DA4F0 (0 / 0x10), 0x684B30 (0 / 0xCC), and in the menu layer
+0x8DBE34 (1 / 0), alphas at 0x8DBE60... (0xFF / 0x00) and pointers. fo2InRace (the pad's race / menu choice) is now false while
+0x8DBE34 or 0x8DA4EC is 1 (FO2_PAUSE_FLAG=0: physics only). Which of them a LAN pause sets is not known yet (user test).
+
+**LAN finished (2026-11-17).** The user confirmed the pause menu in a LAN race (quit, Yes / No). LAN is now on by default
+(fo2_imports.inc lanOn: FO2_LAN=0 turns it off), and the launcher keeps the Wi-Fi awake by default (FO2_WIFI_AWAKE=0 leaves it).
+The LAN probes are out of work/gen/recomp_0015.c and the runtime; the crash report (nfsInstallCrashHandler) and the [FO2 NET]
+statistics stay. The two pause flags, read four times a second through a whole automatic race: 0 throughout the driving, 0x8DA4EC
+at 1 for 0.3 s at the race load (no effect). Build 94f546c7... on the four consoles, fo2.env test lines removed.
+
+**Native gamepad (analog steering), investigation, 2026-11-17, not working yet.** With FO2_DIRECTINPUT_PAD=1 the game finds the
+pad (offered as an Xbox 360 pad, 045E:028E, data format c_dfDIJoystick2: 272 bytes, 164 objects), the user can select it in
+Options > Controls ("Android Gamepad": options.cfg Controller = 1, ControllerGuid = "444956444950000000000000028e045e"), and the
+game polls it every frame: sub_00561610 (Poll, Acquire if needed, force feedback on/off, GetDeviceState into manager+0x2224 +
+index * 0x110, previous state kept at +0x2460), called by sub_0055B490 for the two pad slots (present when [manager+0x4674+i*4]
+and byte 0x8D8160+i is 0), which then copies the states (0x220 bytes) to manager+0. The analog values arrive (x from -10000 to
+10000), yet nothing else reads them: hardware read watchpoints on the buttons (+0x30) and lX (+0) of both copies caught only
+those copies, in the menus and in a race. With the host's keys off (FO2_PAD_KEYS=0) nothing answers, intro movies included.
+Savegame/am<guid>.dat (16-byte entries: action, value, type, 0; header 0x00010002 and three settings) holds only keyboard
+virtual-key codes (type 0); deleted, the game writes the same defaults back, and its remap screen changed nothing. The stick
+no longer sends arrows in a race when the pad is offered (sdl_gamepad.h padOffered), so with the pad offered the stick does
+nothing. Leads: sub_0055B4E0 (a switch on the controller type 0..9 calling 0x561A40 / 0x5619C0, device creation per type),
+the second GetDeviceState site 0x5C3FEE (sub_005C3F90, a 0x110 / 0x114 state, another input system), and how Controller /
+ControllerLayout select the reader. The RG34XX-SP is back to the keyboard setup (fo2.env removed, Controller = 0).
+
+**Native gamepad: solved, default since 2.0.0.** The game reads the pad only through the bindings of am<guid>.dat, and an
+entry can be an axis: type 1, value = axis index (0..7: X, Y, Z, RX, RY, RZ, U, V), extra = rest (low int16) and fully
+pushed (high int16). Steering left (action 12) = axis 0 from 0 to -10000, right (13) = axis 0 from 0 to +10000; every other
+action keeps its keyboard key (type 0), so the host still sends keys for the buttons. That file is port/pad/; the launcher
+installs it once (marker Savegame/.pad_bindings_v1, the previous file kept as .before-2.0; a later remap is kept) and sets
+options.cfg Controller = 1 with the pad's GUID at every launch. The pad is offered by default (FO2_DIRECTINPUT_PAD=0: the
+keyboard of 1.x, Controller = 0). Host side (sdl_gamepad.h): in a race neither the stick nor the d-pad sends arrows; the
+d-pad drives axis X when the stick rests (consoles without a stick: full lock, as before). Stick dead zone rescaled (no jump):
+FO2_STICK_DEADZONE percent, 15 by default, full output from 95 % (cheap sticks rest off-centre and rarely reach the edge). The
+game's own ControllerDeadzone (0), ControllerSaturation (90) and ControllerSensitivity (90) apply after it. User test on the
+RG34XX-SP: "C'est progressif". The release zip (made by hand for 1.1.0) must now hold flatout2/pad/.
 
 **The d3dx9_30.dll filter.** Lifting all 17,876 catalogued functions gave 5 GB of C: four sources Clang
 refused ("ran out of source locations"), nine with branches to missing labels. Most of it is data decoded as

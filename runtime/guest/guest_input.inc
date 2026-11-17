@@ -195,7 +195,7 @@ bool joystickMethod(InputObject& object,uint32_t self,uint32_t method){
         static const bool padTrace=std::getenv("FO2_PAD_TRACE")!=nullptr;static uint32_t lastButtons=~0u;static int lastHat=99;
         if(padTrace&&(inputPad.buttons!=lastButtons||inputPad.hatX*3+inputPad.hatY!=lastHat)){lastButtons=inputPad.buttons;lastHat=inputPad.hatX*3+inputPad.hatY;
             std::string set;for(auto& item:object.format)if(item.bytes==1&&*static_cast<uint8_t*>(ptr(arg(2)+item.offset,1)))set+=" +"+std::to_string(item.offset);
-            NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","PAD read: host buttons=%03x hat=%d,%d x=%d y=%d pov=%d; set bytes:%s",inputPad.buttons,inputPad.hatX,inputPad.hatY,
+            NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","PAD read into %08x: host buttons=%03x hat=%d,%d x=%d y=%d pov=%d; set bytes:%s",arg(2),inputPad.buttons,inputPad.hatX,inputPad.hatY,
                 int32_t(read32(arg(2))),int32_t(read32(arg(2)+4)),int32_t(read32(arg(2)+32)),set.c_str());}
         ret(0,3);return true;}
     case 10:{uint32_t bytes=arg(1),out=arg(2),count=arg(3),flags=arg(4);
@@ -366,7 +366,8 @@ void inputDispatch(){
             // guest_window.inc): a DirectInput pad only gets the keyboard's key codes as bindings
             // (Savegame/am<guid>.dat) and answers no button. The pad is not offered; the host turns its
             // buttons into keys (sdl_gamepad.h). FO2_DIRECTINPUT_PAD=1 offers it again.
-            static const bool offerPad=std::getenv("FO2_DIRECTINPUT_PAD")!=nullptr;
+            // Offered since v2.0.0 (analog steering, the launcher binds the steering to its X axis): FO2_DIRECTINPUT_PAD=0 hides it.
+            static const bool offerPad=[]{const char* e=std::getenv("FO2_DIRECTINPUT_PAD");return !(e&&e[0]=='0');}();
             bool pad;{std::lock_guard<std::mutex> lock(inputMutex);pad=inputPadConnected&&offerPad;}
             NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","DirectInput EnumDevices type=%u flags=%x gamepad=%d",type,flags,int(pad));
             uint32_t instance=allocate(580);

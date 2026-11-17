@@ -121,6 +121,23 @@ if [ "${FO2_KEEP_SETTINGS:-0}" != "1" ] && [ -f "$OPTIONS" ]; then
          -e 's/^\(Settings\.Visual\.SunFlare = \)[A-Z]*/\1FALSE/' "$OPTIONS"
 fi
 
+# Native gamepad (since 2.0.0): the console is offered to the game as an Xbox 360 pad and the game is set to use it,
+# with the steering on the stick's X axis (analog; the d-pad drives that axis on consoles without a stick). The pad's
+# bindings (pad/am<guid>.dat) are installed once: a remap made later in the game's Controls menu is kept.
+# FO2_DIRECTINPUT_PAD=0 goes back to the keyboard of 1.x (digital steering).
+PAD_GUID=444956444950000000000000028e045e
+if [ "${FO2_DIRECTINPUT_PAD:-1}" != "0" ] && [ -f "$OPTIONS" ]; then
+  sed -i -e 's/^\(Settings\.Control\.Controller *= *\)[0-9]*/\11/' \
+         -e "s/^\(Settings\.Control\.ControllerGuid *= *\).*/\1\"$PAD_GUID\"/" "$OPTIONS"
+  BINDINGS="$GAMEDIR/gamedata/Savegame/am$PAD_GUID.dat"
+  if [ -f "$GAMEDIR/pad/am$PAD_GUID.dat" ] && [ ! -f "$GAMEDIR/gamedata/Savegame/.pad_bindings_v1" ]; then
+    [ -f "$BINDINGS" ] && cp -f "$BINDINGS" "$BINDINGS.before-2.0"
+    cp -f "$GAMEDIR/pad/am$PAD_GUID.dat" "$BINDINGS" && touch "$GAMEDIR/gamedata/Savegame/.pad_bindings_v1"
+  fi
+elif [ -f "$OPTIONS" ]; then
+  sed -i 's/^\(Settings\.Control\.Controller *= *\)[0-9]*/\10/' "$OPTIONS"
+fi
+
 # GPU at its top clock while the game runs (restored on exit). The RG34XX-SP's GPU offers only
 # simple_ondemand (no "performance" governor): its minimum frequency is raised to the highest one instead.
 CLOCK_STATE=""
@@ -158,8 +175,27 @@ WATCH_PID=$!
 cleanup() {
   kill "$WATCH_PID" 2>/dev/null
   for entry in $CLOCK_STATE; do wsys "${entry%%=*}" "${entry#*=}"; done
+  for ifc in $WIFI_STATE; do $ESUDO iw dev "$ifc" set power_save on 2>/dev/null; done
   sync
 }
+# LAN (on unless FO2_LAN=0): the Wi-Fi's power saving delays packets by up to a few hundred milliseconds (measured 300-600 ms on
+# the RG351P and GKD Pixel II's USB adapters while the game ran), long enough for the game to drop a player. It is
+# turned off while the game runs and put back on exit. FO2_WIFI_AWAKE=0 leaves it alone.
+WIFI_STATE=""
+if [ "${FO2_LAN:-1}" != "0" ] && [ "${FO2_WIFI_AWAKE:-1}" != "0" ]; then
+  for dev in /sys/class/net/wlan*; do
+    [ -e "$dev" ] || continue; ifc=${dev##*/}
+    if command -v iw > /dev/null 2>&1; then
+      ps=$(iw dev "$ifc" get power_save 2>/dev/null | awk '{print $NF}')
+      [ "$ps" = "on" ] && $ESUDO iw dev "$ifc" set power_save off 2>/dev/null && WIFI_STATE="$WIFI_STATE $ifc"
+    fi
+  done
+  for prm in /sys/module/*/parameters/rtw_power_mgnt; do   # Realtek out-of-tree drivers (8188eu, 8821cs): read at the next connection
+    [ -e "$prm" ] || continue; old=$(cat "$prm")
+    [ "$old" != "0" ] && wsys "$prm" 0 && CLOCK_STATE="$CLOCK_STATE $prm=$old"
+  done
+  echo "LAN: Wi-Fi power saving off on:${WIFI_STATE:- (iw not available)}"
+fi
 trap cleanup EXIT
 
 chmod +x ./fo2.aarch64

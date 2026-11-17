@@ -16,6 +16,7 @@
 #include <SDL.h>
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -72,16 +73,38 @@ public:
     }
     template<class SetKey> void releaseAll(SetKey&& setKey) {
         buttons_.fill(false);
-        stickX_ = stickY_ = rightX_ = rightY_ = leftTrigger_ = rightTrigger_ = 0;
+        stickX_ = stickY_ = rightX_ = rightY_ = leftTrigger_ = rightTrigger_ = dpadX_ = 0;
         apply(driving_, setKey);
     }
     bool held(Button b) const { return buttons_[b]; }
+
+    // The d-pad's X value moves toward full lock in FO2_DPAD_RAMP_MS (150 by default; 0: at once) and back to the centre
+    // twice as fast. Called every main-loop pass; true when the value changed (the pad state must be republished).
+    bool tickDpad() {
+        static const float rampMs = [] { const char* e = std::getenv("FO2_DPAD_RAMP_MS"); return e ? float(std::fmax(std::atof(e), 0.0)) : 150.0f; }();
+        const auto now = std::chrono::steady_clock::now();
+        const float ms = dpadLast_.time_since_epoch().count() ? std::chrono::duration<float, std::milli>(now - dpadLast_).count() : 0.0f;
+        dpadLast_ = now;
+        const float target = (buttons_[Right] ? 1.0f : 0.0f) - (buttons_[Left] ? 1.0f : 0.0f);
+        if (dpadX_ == target) return false;
+        if (rampMs <= 0.0f) { dpadX_ = target; return true; }
+        const bool outward = target != 0.0f && dpadX_ * target >= 0.0f;   // pushing further, not releasing or reversing
+        const float step = std::fmin(ms, 50.0f) / (outward ? rampMs : rampMs * 0.5f);
+        dpadX_ = dpadX_ < target ? std::fmin(dpadX_ + step, target) : std::fmax(dpadX_ - step, target);
+        return true;
+    }
 
     // The DirectInput joystick, laid out as the Xbox 360 controller the runtime announces (045E:028E): X/Y
     // left stick, Z both triggers (left +, right -), X/Y rotation right stick, hat = d-pad, buttons 0-9 =
     // A B X Y LB RB Back Start LS RS. Only seen by the game with FO2_DIRECTINPUT_PAD=1 (see apply).
     void padState(float axes[6], uint32_t& buttons, int& hatX, int& hatY) const {
-        axes[0] = stickX_; axes[1] = stickY_;
+        // The d-pad also moves the left stick when the stick rests: FlatOut 2's steering is bound to its X axis in pad
+        // mode (Savegame/am<guid>.dat), and consoles without a stick (GKD Pixel II) steer with the d-pad. Its X value
+        // ramps (tickDpad) as a thumb would push a stick, as the game's own keyboard steering did.
+        // In races only: in the menus the d-pad already sends arrows.
+        const float dpadY = driving_ ? (buttons_[Down] ? 1.0f : 0.0f) - (buttons_[Up] ? 1.0f : 0.0f) : 0.0f;
+        axes[0] = std::fabs(stickX_) > 0.05f ? stickX_ : (driving_ ? dpadX_ : 0.0f);
+        axes[1] = std::fabs(stickY_) > 0.05f ? stickY_ : dpadY;
         axes[2] = std::max(leftTrigger_, buttons_[L2] ? 1.0f : 0.0f) - std::max(rightTrigger_, buttons_[R2] ? 1.0f : 0.0f);
         axes[3] = rightX_; axes[4] = rightY_; axes[5] = 0;
         static const Button order[10] = {A, B, X, Y, L1, R1, Select, Start, ThumbL, ThumbR};
@@ -94,10 +117,20 @@ public:
 private:
     std::array<bool, ButtonCount> buttons_{};
     float stickX_ = 0, stickY_ = 0, rightX_ = 0, rightY_ = 0, leftTrigger_ = 0, rightTrigger_ = 0;
+    float dpadX_ = 0;
+    std::chrono::steady_clock::time_point dpadLast_{};
     std::array<bool, 256> sent_{};
     bool driving_ = false;
 
-    static float dead(float v) { return std::fabs(v) < 0.10f ? 0.0f : v; }
+    // Stick dead zone, rescaled so the output starts at 0 past it (no jump). Cheap handheld sticks rest off-centre and
+    // rarely reach their edge: FO2_STICK_DEADZONE (percent, 15 by default) at the centre, full output from 95 %.
+    static float dead(float v) {
+        static const float zone = [] { const char* e = std::getenv("FO2_STICK_DEADZONE"); const float p = e ? float(std::atof(e)) : 15.0f; return std::fmin(std::fmax(p, 0.0f), 80.0f) / 100.0f; }();
+        const float a = std::fabs(v);
+        if (a <= zone) return 0.0f;
+        const float out = std::fmin((a - zone) / (0.95f - zone), 1.0f);
+        return v < 0 ? -out : out;
+    }
 
     // FlatOut 2 is played on its PC keyboard controls (the game is not offered the pad, see guest_input.inc),
     // laid out like an Xbox pad. The buttons are named by position (SDL): on the RG34XX-SP the bottom one (A
@@ -109,14 +142,20 @@ private:
     //          Select = C (camera), Start = Escape (pause), R2 / L2 = A / Z (manual gearbox up / down)
     // NFSU2's mapping further down is no longer used.
     // FO2_PAD_KEYS=0: no keys at all (the game then only has the pad itself, see FO2_DIRECTINPUT_PAD).
+    static bool padOffered() { static const bool on = [] { const char* e = std::getenv("FO2_DIRECTINPUT_PAD"); return !(e && e[0] == '0'); }(); return on; }
     static bool fo2Keys() { static const bool on = [] { const char* e = std::getenv("FO2_PAD_KEYS"); return !(e && e[0] == '0'); }(); return on; }
     template<class SetKey> void apply(bool driving, SetKey& setKey) {
         std::array<bool, 256> want{};
         if (!fo2Keys()) { driving_ = driving; return; }
         {
             auto past = [&](float value, unsigned scan) { return value > (sent_[scan] ? .25f : .4f); };
-            want[0xcb] = buttons_[Left] || past(-stickX_, 0xcb);
-            want[0xcd] = buttons_[Right] || past(stickX_, 0xcd);
+            // With the pad offered to the game (FO2_DIRECTINPUT_PAD=1, the game's Controller set to it), the left stick
+            // steers through the joystick's X axis, proportionally: in a race it no longer sends the arrows, which steer
+            // at full lock and took over. The d-pad keeps them, for consoles without a stick.
+            const bool padSteer = driving && padOffered();
+            const float steerX = padSteer ? 0.0f : stickX_;
+            want[0xcb] = (!padSteer && buttons_[Left]) || past(-steerX, 0xcb);
+            want[0xcd] = (!padSteer && buttons_[Right]) || past(steerX, 0xcd);
             want[0x01] = buttons_[Start];
             if (driving) {
                 // The physics keeps running on the results screen after the finish (the cars drive on), so

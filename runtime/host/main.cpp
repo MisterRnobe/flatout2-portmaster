@@ -406,6 +406,7 @@ static void chooseResolution(R36SHostConfig& config) {
     config.widescreen = false;   // NFSU2's widescreen fix does not apply to this game
 }
 
+extern "C" void nfsInstallCrashHandler();   // guest_runtime.cpp
 int main(int argc, char** argv) {
     // Line-buffered logs: the launcher pipes them to log.txt, and a hang must not swallow the last lines.
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
@@ -442,6 +443,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "Failed to initialize SDL2: %s\n", SDL_GetError());
         return 1;
     }
+    nfsInstallCrashHandler();   // after SDL_Init: the report goes to the log
     chooseResolution(config);
     g_nfsScreenRotation = config.rotation;
     {
@@ -912,7 +914,8 @@ int main(int argc, char** argv) {
         selectTick();
         if (g_quitByCombo) g_running = false;
         // Race <-> menu: the held buttons now mean other keys (sdl_gamepad.h).
-        if (g_gamepad.refresh(fo2InRace(), padSetKey)) publishGamepad();
+        const bool modeChanged = g_gamepad.refresh(fo2InRace(), padSetKey);
+        if (g_gamepad.tickDpad() || modeChanged) publishGamepad();
 
         // Check if D3D9 backend requested surface
         if (d3d9RequestsSurface()) {

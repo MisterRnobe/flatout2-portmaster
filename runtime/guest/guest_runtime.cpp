@@ -1485,9 +1485,19 @@ extern "C" void recomp_hook(uint32_t va){
         }
     }
 }
+// The in-race pause menu: in a single race it stops the physics, but in a LAN race the race goes on under it, so the pad
+// stayed on its race mapping and the confirm button sent accelerate (the quit confirmation could not be validated).
+// Memory snapshots of a single race, pause opened and closed twice (docs/NOTES.md): 0x8DA4EC, 0x8DA4F8, 0x8DA514 and
+// the menu layer's 0x8DBE34 are 1 exactly while it is open, 0 otherwise. Either one counts. FO2_PAUSE_FLAG=0: physics only.
+static bool fo2PauseMenuOpen(){
+    static const bool on=[]{const char* e=std::getenv("FO2_PAUSE_FLAG");return !(e&&e[0]=='0');}();
+    if(!on||!memory)return false;
+    return read32(0x008DBE34u)==1u||read32(0x008DA4ECu)==1u;
+}
 bool fo2InRace(){
     const int64_t last=lastRacePhysics.load(std::memory_order_relaxed);
-    return last&&std::chrono::steady_clock::now().time_since_epoch().count()-last<int64_t(std::chrono::nanoseconds(std::chrono::milliseconds(300)).count());
+    const bool stepping=last&&std::chrono::steady_clock::now().time_since_epoch().count()-last<int64_t(std::chrono::nanoseconds(std::chrono::milliseconds(300)).count());
+    return stepping&&!fo2PauseMenuOpen();
 }
 void setGuestPad(const float axes[6],uint32_t buttons,int hatX,int hatY){
     std::lock_guard<std::mutex> lock(inputMutex);
@@ -1570,6 +1580,37 @@ void d3d9BridgeWaitWithoutMachine(const std::function<void()>& wait){
     machineLease->lock();saved.load();
 }
 extern "C" bool nfsParallelGuest(){return parallelGuest;}
+// Crash report (SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT): what faulted, the guest registers as last synchronised by this
+// thread, and the host call chain by frame pointers (the lifted functions are host functions, so this is the guest's call
+// chain: resolve the addresses with the binary's symbol table). Written to stderr, which the launcher sends to log.txt.
+#include <signal.h>
+#include <ucontext.h>
+static void nfsCrashHandler(int sig,siginfo_t* info,void* context){
+    static std::atomic<int> entered{0};
+    if(entered.fetch_add(1))_exit(128+sig);
+    const ucontext_t* uc=static_cast<const ucontext_t*>(context);
+    const uint64_t pc=uc->uc_mcontext.pc,lr=uc->uc_mcontext.regs[30];uint64_t fp=uc->uc_mcontext.regs[29];
+    const uint64_t address=reinterpret_cast<uint64_t>(info->si_addr);
+    char name[32]="?";pthread_getname_np(pthread_self(),name,sizeof name);
+    std::fprintf(stderr,"[FO2 CRASH] signal %d, address %llx",sig,static_cast<unsigned long long>(address));
+    if(address>=NFS_FIXED_GUEST_BASE&&address<NFS_FIXED_GUEST_BASE+0x100000000ULL)std::fprintf(stderr," (guest %08llx)",static_cast<unsigned long long>(address-NFS_FIXED_GUEST_BASE));
+    std::fprintf(stderr,", pc %llx lr %llx, thread %s (guest thread %u)\n",static_cast<unsigned long long>(pc),static_cast<unsigned long long>(lr),name,guestThreadId);
+    std::fprintf(stderr,"[FO2 CRASH] guest eax %08x ecx %08x edx %08x ebx %08x esp %08x ebp %08x esi %08x edi %08x\n",g_eax,g_ecx,g_edx,g_ebx,g_esp,g_ebp,g_esi,g_edi);
+    std::fprintf(stderr,"[FO2 CRASH] chain: %llx %llx",static_cast<unsigned long long>(pc),static_cast<unsigned long long>(lr));
+    for(int i=0;i<40&&fp>0x10000&&!(fp&7);++i){
+        const uint64_t* frame=reinterpret_cast<const uint64_t*>(fp);
+        const uint64_t next=frame[0],ret=frame[1];
+        std::fprintf(stderr," %llx",static_cast<unsigned long long>(ret));
+        if(next<=fp)break;
+        fp=next;
+    }
+    std::fprintf(stderr,"\n");std::fflush(stderr);
+    signal(sig,SIG_DFL);raise(sig);
+}
+extern "C" void nfsInstallCrashHandler(){
+    struct sigaction action{};action.sa_sigaction=nfsCrashHandler;action.sa_flags=SA_SIGINFO;sigemptyset(&action.sa_mask);
+    for(int sig:{SIGSEGV,SIGBUS,SIGILL,SIGFPE,SIGABRT})sigaction(sig,&action,nullptr);
+}
 
 #if defined(__ANDROID__) || defined(NFS_D3D9_BACKEND)
 // Cacheable D3D9 COM entry: the method comes from the call's VA (nfs_icall_va), not from a lookup side

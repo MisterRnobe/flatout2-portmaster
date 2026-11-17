@@ -57,14 +57,21 @@ You need the **GOG / Zoom Platform** version of the game (v2.1.0.9). Its `FlatOu
 
 The first race after an install or an update can stutter for a moment: the port is filling its shader cache. It does not come back afterwards.
 
+### Updating from 1.1.0
+
+Replace `ports/flatout2/fo2.aarch64` and `FlatOut 2.sh` with the new ones, and copy the new `ports/flatout2/pad` folder. Your game files and your saves stay as they are. The launcher switches the game to its gamepad controls by itself.
+
 ### Updating from 1.0.0
 
-Replace `ports/flatout2/fo2.aarch64` with the new one, copy the new `FlatOut 2.sh`, and delete the two old launchers (`FlatOut 2 [RK3326 - 30 FPS].sh` and `FlatOut 2 [H700 - FPS Unlock].sh`). Your game files and your saves stay as they are.
+Do the same, then delete the two old launchers (`FlatOut 2 [RK3326 - 30 FPS].sh` and `FlatOut 2 [H700 - FPS Unlock].sh`).
 
 ## Controls
 
+The console is seen by the game as an Xbox gamepad: **steering is analog** on the left stick. On consoles without a stick, the d-pad steers progressively, like a stick pushed by the thumb. A small dead zone ignores a stick that drifts at rest.
+
 | Button | In a race |
 |---|---|
+| Left stick / d-pad | Steer |
 | South button | Accelerate, confirm |
 | West button | Brake, reverse |
 | East button | Handbrake, back |
@@ -74,12 +81,23 @@ Replace `ports/flatout2/fo2.aarch64` with the new one, copy the new `FlatOut 2.s
 | Select | Change camera |
 | Start | Pause |
 
+The game's own Options > Controls menu can remap the controls and set the steering's dead zone, saturation and sensitivity. Your changes are kept.
+
 | Combination | Action |
 |---|---|
 | **Select + L1** | Swaps A/B and X/Y, remembered. Use it once if your buttons are the wrong way round |
 | **L2 + R2** | Shows or hides the FPS counter, which counts from that moment |
 | **L1 + R2** | Screenshot, saved as `ports/flatout2/screenshot_N.ppm` |
 | **Select + Start** | Quit |
+
+## LAN multiplayer
+
+Up to 8 players over the same Wi-Fi network: in the game, choose Multiplayer, then LAN. One console creates the game, the others join it. Tested with four consoles (RG34XX-SP, GKD Pixel II, two RG351P) and a Windows PC running the GOG / Zoom version, which can host or join.
+
+- The launcher turns off the Wi-Fi's power saving while the game runs (it delayed packets long enough to drop players), and puts it back on exit.
+- **On a Windows PC:** the network must be set as private, and VPN adapters such as Radmin VPN can take the game's traffic away from your Wi-Fi: quit them before playing.
+- **RG351P on dArkOS:** turn on zram (swap) in the system's options, or the console can run out of memory when a LAN race starts.
+- The game uses UDP ports 23756 and 23757.
 
 ## What this port adds
 
@@ -90,23 +108,22 @@ Replace `ports/flatout2/fo2.aarch64` with the new one, copy the new `FlatOut 2.s
 
 ## Known problems
 
-- **LAN play does not work.** The menu is there, but the feature is not finished.
-- Online play is not available.
+- Online play is not available (LAN only).
+- On weak Wi-Fi, a console can lose its connection during a LAN race.
 - Small graphical glitches can appear with the sparks when cars touch.
 - On RK3326 consoles, big crashes can still drop the frame rate for a moment.
 - Short silences can remain in the music during loading screens.
 
 ## Roadmap
 
-- **LAN multiplayer** between consoles on the same Wi-Fi network.
 - **Graphics:** fix the spark glitches.
 - **Performance:** the heaviest moments on small chips.
-- More consoles and screen formats, with your reports.
-- A way to change the controls from the port.
+- More consoles and screen formats (16:9), with your reports.
+- A way to change the game's language.
 
 ## Version
 
-Current version: **1.1.0**. See the [Releases](https://github.com/badcats72/flatout2-portmaster/releases) for what changed.
+Current version: **2.0.0**. See the [Releases](https://github.com/badcats72/flatout2-portmaster/releases) for what changed.
 
 ## Advanced settings
 
@@ -119,6 +136,11 @@ Optional file `ports/flatout2/fo2.env`, one `VARIABLE=value` per line:
 | `FO2_SWAP_ABXY=1` | Start with A/B and X/Y swapped |
 | `FO2_KEEP_SETTINGS=1` | Keep the game's own graphics settings (the launcher otherwise forces the lowest) |
 | `NFSU2_SHOW_FPS=1` | FPS counter on at launch |
+| `FO2_STICK_DEADZONE=15` | Stick dead zone in percent (15 by default). Raise it if your stick drifts |
+| `FO2_DPAD_RAMP_MS=150` | Time for the d-pad to reach full steering, in milliseconds (0: at once) |
+| `FO2_DIRECTINPUT_PAD=0` | Keyboard controls of 1.x (digital steering) instead of the gamepad |
+| `FO2_LAN=0` | LAN off |
+| `FO2_WIFI_AWAKE=0` | Leave the Wi-Fi's power saving on during LAN games |
 | `NFSU2_PARALLEL_THREADS=` | Empty: the sound engine's threads take turns with the game again, as in 1.0.0. Only for diagnosing a sound problem |
 
 ## Source code

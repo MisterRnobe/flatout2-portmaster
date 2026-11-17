@@ -116,44 +116,74 @@ void wsaFail1(){socketError(1);}void wsaFail2(){socketError(2);}void wsaFail4(){
 void wsaFail5(){socketError(5);}void wsaFail7(){socketError(7);}void wsaFail9(){socketError(9);}
 // LAN play: the game's overlapped UDP calls, over the non-blocking sockets of guest_network.inc. A send completes at once;
 // a receive with nothing to read is queued and looked at again whenever the game waits or asks for a result.
-// Not finished: a console that receives a packet crashes (docs/NOTES.md), so these calls fail as before unless FO2_LAN=1.
+// LAN multiplayer works since 2026-11-17 (four consoles and the Windows game together, docs/NOTES.md). FO2_LAN=0: these calls fail as in v1.x.
 namespace wsaov {
-bool lanOn(){static const bool on=[]{const char* e=std::getenv("FO2_LAN");return e&&e[0]=='1';}();return on;}
+bool lanOn(){static const bool on=[]{const char* e=std::getenv("FO2_LAN");return !(e&&e[0]=='0');}();return on;}
 std::map<uint32_t,bool> events;
 uint32_t nextEvent=0x00f30001u;
-struct PendingRecv{uint32_t socket,buffers,count,flags,from,fromLength,overlapped;};
+// A receive left pending: the WSABUF array is copied at the call (the game builds it on its stack), and its "received" and
+// "flags" pointers are not kept: Windows does not write them once the call has returned WSA_IO_PENDING, and they too are
+// stack variables. Writing 0 through the stale flags pointer when the packet came overwrote a saved ebp of the receiving
+// thread: the crash of every console that received a LAN packet (0x5070C0 reading [ebp+0x1128] with ebp = 0).
+typedef std::vector<std::pair<uint32_t,uint32_t>> Buffers;   // length, data
+Buffers copyBuffers(uint32_t buffers,uint32_t count){Buffers list;for(uint32_t i=0;i<count&&i<64;++i)list.emplace_back(read32(buffers+i*8),read32(buffers+i*8+4));return list;}
+struct PendingRecv{uint32_t socket;Buffers buffers;uint32_t from,fromLength,overlapped;};
 std::vector<PendingRecv> pending;
 void complete(uint32_t overlapped,uint32_t bytes,uint32_t status){
     if(!overlapped)return;
     write32(overlapped,status);write32(overlapped+4,bytes);
     auto event=events.find(read32(overlapped+16));if(event!=events.end())event->second=true;
 }
+// LAN statistics, every 5 s while packets flow ([FO2 NET] lines): packets and bytes sent and received, and per peer the
+// longest silence between two of its packets. A peer silent for long while the others are not points at its Wi-Fi.
+struct PeerStat{uint64_t packets=0,bytes=0;std::chrono::steady_clock::time_point last{};double maxGapMs=0;};
+std::map<std::string,PeerStat> peers;uint64_t sentPackets=0,sentBytes=0,sendErrors=0;
+void report(){
+    static auto last=std::chrono::steady_clock::now();
+    const auto now=std::chrono::steady_clock::now();
+    if(now-last<std::chrono::seconds(5))return;
+    last=now;
+    std::string line;char b[128];
+    for(auto& item:peers){std::snprintf(b,sizeof b," %s %llu pkts (longest gap %.0f ms);",item.first.c_str(),(unsigned long long)item.second.packets,item.second.maxGapMs);line+=b;item.second.packets=0;item.second.maxGapMs=0;}
+    std::printf("[FO2 NET] 5 s: sent %llu pkts / %llu bytes, %llu send errors; received from:%s\n",(unsigned long long)sentPackets,(unsigned long long)sentBytes,(unsigned long long)sendErrors,line.empty()?" nobody":line.c_str());
+    sentPackets=sentBytes=sendErrors=0;
+}
+void noteReceived(const sockaddr_storage& peer,size_t bytes){
+    const std::string key=net::describe(peer);
+    PeerStat& stat=peers[key.substr(0,key.find(':'))];
+    const auto now=std::chrono::steady_clock::now();
+    if(stat.last!=std::chrono::steady_clock::time_point{})stat.maxGapMs=std::max(stat.maxGapMs,std::chrono::duration<double,std::milli>(now-stat.last).count());
+    stat.last=now;++stat.packets;stat.bytes+=bytes;
+    report();
+}
 // 1 a datagram was read, 0 nothing to read, -1 error
-int receive(const net::Socket& socket,uint32_t buffers,uint32_t count,uint32_t flags,uint32_t from,uint32_t fromLength,uint32_t& bytes){
+int receive(const net::Socket& socket,const Buffers& buffers,uint32_t flags,uint32_t from,uint32_t fromLength,uint32_t& bytes){
     static std::vector<uint8_t> message(65536);
     sockaddr_storage peer{};socklen_t peerLength=sizeof peer;
     const ssize_t got=::recvfrom(socket.fd,message.data(),message.size(),MSG_DONTWAIT,reinterpret_cast<sockaddr*>(&peer),&peerLength);
     if(got<0)return errno==EAGAIN||errno==EWOULDBLOCK?0:-1;
     size_t done=0;
-    for(uint32_t i=0;i<count&&done<size_t(got);++i){
-        const uint32_t length=read32(buffers+i*8),data=read32(buffers+i*8+4);
+    for(size_t i=0;i<buffers.size()&&done<size_t(got);++i){
+        const uint32_t length=buffers[i].first,data=buffers[i].second;
         const size_t part=std::min<size_t>(length,size_t(got)-done);
         if(part)std::memcpy(ptr(data,uint32_t(part)),message.data()+done,part);
         done+=part;
     }
     bytes=uint32_t(done);
+    noteReceived(peer,size_t(got));
     if(from&&fromLength)net::storeAddress(from,fromLength,peer,std::min<socklen_t>(peerLength,16));
     if(flags)write32(flags,0);
     return 1;
 }
 void poll(){
     for(size_t i=0;i<pending.size();){
-        const PendingRecv op=pending[i];
+        const PendingRecv& op=pending[i];
         auto* socket=net::find(op.socket);
         uint32_t bytes=0;
-        const int result=socket?receive(*socket,op.buffers,op.count,op.flags,op.from,op.fromLength,bytes):-1;
+        const int result=socket?receive(*socket,op.buffers,0,op.from,op.fromLength,bytes):-1;
         if(result==0){++i;continue;}
-        if(result>0)complete(op.overlapped,bytes,0);else complete(op.overlapped,0,0xC0000120u);   // STATUS_CANCELLED
+        const uint32_t overlapped=op.overlapped;
+        if(result>0)complete(overlapped,bytes,0);else complete(overlapped,0,0xC0000120u);   // STATUS_CANCELLED
         pending.erase(pending.begin()+long(i));
     }
 }
@@ -175,7 +205,8 @@ void wsaSendTo(){   // (socket, WSABUF*, count, sent*, flags, to, toLength, over
     if(arg(5)){addressLength=net::guestAddress(arg(5),arg(6),address);if(!addressLength){ret(net::fail(net::wsaEfault),9);return;}}
     static int shown=0;if(shown<40&&addressLength){++shown;std::printf("[FO2 NET] send %zu bytes to %s\n",message.size(),net::describe(address).c_str());}
     const ssize_t sent=::sendto(socket->fd,message.data(),message.size(),MSG_DONTWAIT|MSG_NOSIGNAL,addressLength?reinterpret_cast<sockaddr*>(&address):nullptr,addressLength);
-    if(sent<0){ret(net::failErrno(),9);return;}
+    if(sent<0){++wsaov::sendErrors;wsaov::report();ret(net::failErrno(),9);return;}
+    ++wsaov::sentPackets;wsaov::sentBytes+=uint64_t(sent);wsaov::report();
     if(arg(3))write32(arg(3),uint32_t(sent));
     wsaov::complete(arg(7),uint32_t(sent),0);
     ret(0,9);
@@ -184,11 +215,12 @@ void wsaRecvFrom(){ // (socket, WSABUF*, count, received*, flags*, from, fromLen
     if(!wsaov::lanOn()){socketError(9);return;}
     auto* socket=net::find(arg(0));if(!socket){ret(net::fail(net::wsaEnotsock),9);return;}
     uint32_t bytes=0;
-    const int result=wsaov::receive(*socket,arg(1),arg(2),arg(4),arg(5),arg(6),bytes);
+    const wsaov::Buffers buffers=wsaov::copyBuffers(arg(1),arg(2));
+    const int result=wsaov::receive(*socket,buffers,arg(4),arg(5),arg(6),bytes);
     if(result<0){ret(net::failErrno(),9);return;}
     if(result>0){if(arg(3))write32(arg(3),bytes);wsaov::complete(arg(7),bytes,0);ret(0,9);return;}
     if(!arg(7)){ret(net::fail(net::wsaEwouldblock),9);return;}
-    wsaov::pending.push_back({arg(0),arg(1),arg(2),arg(4),arg(5),arg(6),arg(7)});
+    wsaov::pending.push_back({arg(0),buffers,arg(5),arg(6),arg(7)});
     ret(net::fail(997),9);  // WSA_IO_PENDING
 }
 void wsaWaitForMultipleEvents(){    // (count, events*, waitAll, timeout, alertable)
