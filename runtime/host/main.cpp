@@ -446,6 +446,11 @@ int main(int argc, char** argv) {
     std::printf("====================================================\n");
 
     for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--check-crash-handler") == 0) {
+            nfsInstallCrashHandler();
+            std::raise(SIGILL);
+            return 1;
+        }
         if (std::strcmp(argv[i], "--check-runtime") == 0) {
             try {
                 testGuestMemory();

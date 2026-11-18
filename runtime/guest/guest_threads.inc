@@ -91,6 +91,9 @@ void exitThread(){
     throw GuestThreadExit{arg(0)};
 }
 void* guestThreadEntry(void* context){
+#ifdef __APPLE__
+    nfsInstallCrashHandler(); // alternate signal stacks belong to each native thread
+#endif
     insideGuestThread=true;
     auto& thread=*static_cast<GuestThread*>(context);
     // Name host threads after the guest thread and its entry point, so per-thread CPU reports and

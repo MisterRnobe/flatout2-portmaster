@@ -1,4 +1,5 @@
 #include "../host/macos_compat.h"
+extern "C" void nfsInstallCrashHandler();
 #ifndef __APPLE__
 #define fo2Socket socket
 #define fo2Accept4 accept4
@@ -1599,10 +1600,36 @@ extern "C" bool nfsParallelGuest(){return parallelGuest;}
 #include <signal.h>
 #ifdef __APPLE__
 #include <sys/ucontext.h>
+#include <mach-o/dyld.h>
 #else
 #include <ucontext.h>
 #endif
+#ifdef __APPLE__
+static const uintptr_t crashImageBase=reinterpret_cast<uintptr_t>(_dyld_get_image_header(0));
+// Emit the minimum report before TLS, stdio locks, or frame-pointer walking.
+// The diagnostic must survive a second fault in the detailed reporter below.
+static void macCrashRecord(int sig, siginfo_t* info, const ucontext_t* uc){
+    char output[256]; size_t length=0;
+    auto text=[&](const char* value){while(*value)output[length++]=*value++;};
+    auto hex=[&](uint64_t value){
+        const char* digits="0123456789abcdef";text("0x");
+        for(int shift=60;shift>=0;shift-=4)output[length++]=digits[(value>>shift)&15];
+    };
+    text("[FO2 FAULT] signal=");hex(sig);
+    text(" code=");hex(info->si_code);
+    text(" pc=");hex(uc->uc_mcontext->__ss.__pc);
+    text(" lr=");hex(uc->uc_mcontext->__ss.__lr);
+    text(" sp=");hex(uc->uc_mcontext->__ss.__sp);
+    text(" image=");hex(crashImageBase);
+    text(" address=");hex(reinterpret_cast<uintptr_t>(info->si_addr));
+    text("\n");
+    (void)!write(STDERR_FILENO,output,length);
+}
+#endif
 static void nfsCrashHandler(int sig,siginfo_t* info,void* context){
+#ifdef __APPLE__
+    macCrashRecord(sig,info,static_cast<const ucontext_t*>(context));
+#endif
     static std::atomic<int> entered{0};
     if(entered.fetch_add(1))_exit(128+sig);
     const ucontext_t* uc=static_cast<const ucontext_t*>(context);
@@ -1629,7 +1656,12 @@ static void nfsCrashHandler(int sig,siginfo_t* info,void* context){
     signal(sig,SIG_DFL);raise(sig);
 }
 extern "C" void nfsInstallCrashHandler(){
-    struct sigaction action{};action.sa_sigaction=nfsCrashHandler;action.sa_flags=SA_SIGINFO;sigemptyset(&action.sa_mask);
+    #ifdef __APPLE__
+    alignas(16) static thread_local unsigned char alternateStack[64u<<10];
+    stack_t stack{};stack.ss_sp=alternateStack;stack.ss_size=sizeof alternateStack;
+    if(sigaltstack(&stack,nullptr))perror("FO2 sigaltstack");
+#endif
+    struct sigaction action{};action.sa_sigaction=nfsCrashHandler;action.sa_flags=SA_SIGINFO|SA_ONSTACK;sigemptyset(&action.sa_mask);
     for(int sig:{SIGSEGV,SIGBUS,SIGILL,SIGFPE,SIGABRT})sigaction(sig,&action,nullptr);
 }
 

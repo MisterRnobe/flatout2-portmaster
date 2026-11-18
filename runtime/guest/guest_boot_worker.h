@@ -6,6 +6,8 @@
 #include <stdexcept>
 #include <atomic>
 
+extern "C" void nfsInstallCrashHandler();
+
 class GuestBootWorker {
     pthread_t thread_{};
     bool started_=false;
@@ -13,6 +15,9 @@ class GuestBootWorker {
     std::mutex mutex_;
     std::string executable_,status_="Arranque CRT pendiente";
     static void* run(void* context) {
+        #ifdef __APPLE__
+        nfsInstallCrashHandler();
+#endif
         auto& self=*static_cast<GuestBootWorker*>(context);
         auto result=connectGuestRuntime(self.executable_.c_str());
         {
