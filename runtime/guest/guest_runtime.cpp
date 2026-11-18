@@ -1,3 +1,8 @@
+#include "../host/macos_compat.h"
+#ifndef __APPLE__
+#define fo2Socket socket
+#define fo2Accept4 accept4
+#endif
 #include <set>
 #include <condition_variable>
 #include "guest_runtime.h"
@@ -711,7 +716,7 @@ void bindImports(uint32_t base, uint32_t size, uint32_t directoryRva, uint32_t d
     }
     if (!terminated) throw GuestStop("Unterminated PE import descriptors");
 }
-extern "C" const char nfs_exe_lifted_from[] __attribute__((weak));   // recomp_variant.c
+extern "C" const char nfs_exe_lifted_from[] FO2_WEAK_IMPORT;   // recomp_variant.c
 // The launcher (ports/r36s/package/NFSU2.sh) finds this string in the binary to check the exe before starting.
 extern "C" __attribute__((used)) const char nfs_exe_built_for[] = NFS_EXE_BUILT_FOR;
 void loadImage(const char* path) {
@@ -1202,7 +1207,7 @@ extern "C" int nfs_android_resolution(){
 #endif
 }
 
-std::string connectGuestRuntime(const char* executable) {
+std::string connectGuestRuntime(const char* executable, bool checkOnly) {
     std::unique_lock<MachineMutex> guard(machine);machineLease=&guard;
     if (memory) return "Runtime guest ya inicializado";
     State original; original.save();
@@ -1264,6 +1269,14 @@ std::string connectGuestRuntime(const char* executable) {
 #endif
         fresh.load();
         bindGuestModuleImports();   // d3dx9_30.dll: mapped, DllMain run, the exe's IAT slots pointed at its exports
+        if (checkOnly) {
+            joinGuestThreads(guard);machineLease=nullptr;shutdownGuestSound();
+#if defined(__ANDROID__) || defined(NFS_D3D9_BACKEND)
+            shutdownD3D9Bridge();
+#endif
+            original.load();
+            return "Runtime check passed";
+        }
         // Restore a clean CPU state before executing the real CRT entry.
         fresh.load();
         NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Entering actual lifted CRT entry %08x",entry);
@@ -1584,12 +1597,20 @@ extern "C" bool nfsParallelGuest(){return parallelGuest;}
 // thread, and the host call chain by frame pointers (the lifted functions are host functions, so this is the guest's call
 // chain: resolve the addresses with the binary's symbol table). Written to stderr, which the launcher sends to log.txt.
 #include <signal.h>
+#ifdef __APPLE__
+#include <sys/ucontext.h>
+#else
 #include <ucontext.h>
+#endif
 static void nfsCrashHandler(int sig,siginfo_t* info,void* context){
     static std::atomic<int> entered{0};
     if(entered.fetch_add(1))_exit(128+sig);
     const ucontext_t* uc=static_cast<const ucontext_t*>(context);
+    #ifdef __APPLE__
+    const uint64_t pc=uc->uc_mcontext->__ss.__pc,lr=uc->uc_mcontext->__ss.__lr;uint64_t fp=uc->uc_mcontext->__ss.__fp;
+#else
     const uint64_t pc=uc->uc_mcontext.pc,lr=uc->uc_mcontext.regs[30];uint64_t fp=uc->uc_mcontext.regs[29];
+#endif
     const uint64_t address=reinterpret_cast<uint64_t>(info->si_addr);
     char name[32]="?";pthread_getname_np(pthread_self(),name,sizeof name);
     std::fprintf(stderr,"[FO2 CRASH] signal %d, address %llx",sig,static_cast<unsigned long long>(address));

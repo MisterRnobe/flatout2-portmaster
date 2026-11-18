@@ -29,3 +29,7 @@ mem*.txt
 *.ppm
 shadercache/
 shaderdump/
+
+# Python build helpers
+__pycache__/
+*.pyc

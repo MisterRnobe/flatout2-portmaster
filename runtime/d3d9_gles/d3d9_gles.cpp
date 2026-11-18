@@ -1,3 +1,4 @@
+#include "../host/macos_compat.h"
 // Direct3D 9 -> OpenGL ES 2.0 translation for the R36S port.
 //
 // This file must behave like a D3D9 driver: it forwards the game's own shaders, constants,
@@ -12,8 +13,15 @@ extern "C" { unsigned long long g_nfs_call_count = 0; }   // lifted calls (guest
 
 bool guestDrivingControls();  // guest_runtime.cpp: the game is reading driving controls
 
-extern "C" void __gcov_dump(void) __attribute__((weak));
-extern "C" int __llvm_profile_write_file(void) __attribute__((weak));  // clang profile runtime, only in -fprofile-generate builds  // libgcov, only in -fprofile-generate builds
+#ifdef __APPLE__
+static constexpr void (*fo2GcovDump)(void) = nullptr;
+static constexpr int (*fo2ProfileWrite)(void) = nullptr;
+#else
+extern "C" void __gcov_dump(void) FO2_WEAK_IMPORT;
+extern "C" int __llvm_profile_write_file(void) FO2_WEAK_IMPORT;  // clang profile runtime, only in -fprofile-generate builds  // libgcov, only in -fprofile-generate builds
+#define fo2GcovDump __gcov_dump
+#define fo2ProfileWrite __llvm_profile_write_file
+#endif
 extern "C" bool nfsParallelGuest();  // guest_runtime.cpp: guest threads run in parallel
 
 #include <algorithm>
@@ -32,7 +40,11 @@ extern "C" bool nfsParallelGuest();  // guest_runtime.cpp: guest threads run in 
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
+#ifdef __APPLE__
+#include <sys/ucontext.h>
+#else
 #include <ucontext.h>
+#endif
 #include <thread>
 #include <unistd.h>
 #include <cstdlib>
@@ -50,6 +62,14 @@ thread_local bool g_glesDeferTextureGL = false;
 // Panel rotation in degrees (0, 90, 270), set by the host before the device exists (main.cpp, NFSU2_ROTATE).
 uint32_t g_nfsScreenRotation = 0;
 extern "C" void nfs_widescreen_set_resolution(unsigned width, unsigned height);
+
+static long fo2ThreadId() {
+#ifdef __APPLE__
+    uint64_t tid; pthread_threadid_np(nullptr, &tid); return static_cast<long>(tid);
+#else
+    return syscall(SYS_gettid);
+#endif
+}
 
 namespace {
 std::mutex g_windowMutex;
@@ -110,6 +130,7 @@ std::atomic<int64_t> g_lastPresentMs{0};
 int64_t nowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+#ifndef __APPLE__
 struct HangWatchdog {
     HangWatchdog() {
         const char* e = std::getenv("NFSU2_HANG_DUMP");
@@ -122,7 +143,7 @@ struct HangWatchdog {
             void* frames[48];
             int n = backtrace(frames, 48);
             char msg[64];
-            int len = std::snprintf(msg, sizeof(msg), "\n[HANG] thread %ld:\n", static_cast<long>(syscall(SYS_gettid)));
+            int len = std::snprintf(msg, sizeof(msg), "\n[HANG] thread %ld:\n", static_cast<long>(fo2ThreadId()));
             if (len > 0) { ssize_t w = write(2, msg, static_cast<size_t>(len)); (void)w; }
             backtrace_symbols_fd(frames, n, 2);
 #endif
@@ -139,7 +160,7 @@ struct HangWatchdog {
                     if (DIR* d = opendir("/proc/self/task")) {
                         while (dirent* ent = readdir(d)) {
                             const long tid = std::atol(ent->d_name);
-                            if (tid > 0 && tid != static_cast<long>(syscall(SYS_gettid))) {
+                            if (tid > 0 && tid != static_cast<long>(fo2ThreadId())) {
                                 syscall(SYS_tgkill, getpid(), tid, SIGUSR2);
                                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
                             }
@@ -172,7 +193,7 @@ void profHandler(int, siginfo_t*, void* uc) {
     const int i = g_profCount.fetch_add(1, std::memory_order_relaxed);
     if (i >= kProfMax) return;
     g_profPc[i] = static_cast<ucontext_t*>(uc)->uc_mcontext.pc;
-    g_profTid[i] = static_cast<uint32_t>(syscall(SYS_gettid));
+    g_profTid[i] = static_cast<uint32_t>(fo2ThreadId());
 }
 // Wall-clock samples of the game thread (CLOCK_MONOTONIC, 1 kHz, own signal): unlike the CPU-time samples
 // they also land while the thread is blocked or waiting for a core, so they show where wall time goes.
@@ -312,6 +333,13 @@ void profileFrame(uint32_t frame, uint32_t draws) {
     }
 }
 
+#else
+uint32_t g_frameDraws = 0;
+uint32_t g_drawTick = 0;
+struct DrawTimer : glsc::DriverCpuTimer { DrawTimer() : glsc::DriverCpuTimer((++g_drawTick & 7u) == 0 ? 8.0 : 0.0) {} };
+void profileFrame(uint32_t, uint32_t) {}
+#endif
+
 // Every 120 frames: where the process's CPU went (all threads, by name), page faults and memory. On the
 // R36S the game thread's wall time per frame was ~2x its CPU time in a race; this shows whether the rest
 // is other threads holding the guest machine, the GL driver, or paging (1 GB RAM + swap on the SD card).
@@ -328,7 +356,7 @@ std::map<uint32_t, uint64_t> g_csWait;
 extern "C" void nfsReportFreeLockedCalls(unsigned frames);
 extern "C" void nfsCsWait(uint32_t address, uint64_t ns) { std::lock_guard<std::mutex> l(g_csWaitMutex); g_csWait[address] += ns; }
 extern "C" void nfsWaitAdd(int kind, uint64_t ns) { g_waitNs[kind].fetch_add(ns, std::memory_order_relaxed); g_waitFrameNs[kind].fetch_add(ns, std::memory_order_relaxed); }
-extern "C" bool nfsIsGameThread() { static thread_local long tid = syscall(SYS_gettid); return tid == g_gameTid.load(std::memory_order_relaxed); }
+extern "C" bool nfsIsGameThread() { static thread_local long tid = fo2ThreadId(); return tid == g_gameTid.load(std::memory_order_relaxed); }
 
 // R36S speed model for headless runs (see HANDOVER 6.17). Per frame on the game thread:
 //   portable = game-thread CPU - CPU inside the GL driver (game code, bridge and layer: runs the same code on
@@ -1973,7 +2001,7 @@ static std::atomic<uint32_t> g_d3d9PresentCount{0};
 // The bridge's render thread calls this from the game's own thread (the one issuing D3D9 calls).
 extern "C" void d3d9NoteGameThread() {
     if (g_gameTid.load()) return;
-    g_gameTid = static_cast<long>(syscall(SYS_gettid));
+    g_gameTid = static_cast<long>(fo2ThreadId());
     pthread_setname_np(pthread_self(), "game");
 }
 
@@ -2009,7 +2037,7 @@ STDMETHODIMP IDirect3DDevice9GLES::Present(const RECT* pSourceRect, const RECT* 
         std::printf("[TRACE] tracing frame %u\n", frame);
     }
     if (frame == 1 && !g_gameTid.load()) {  // no render thread: the presenting thread is the game's
-        g_gameTid = static_cast<long>(syscall(SYS_gettid));
+        g_gameTid = static_cast<long>(fo2ThreadId());
         pthread_setname_np(pthread_self(), "game");
     }
     g_lastPresentMs = nowMs();
@@ -2044,19 +2072,19 @@ STDMETHODIMP IDirect3DDevice9GLES::Present(const RECT* pSourceRect, const RECT* 
     // frame n (the smoke test ends with SIGKILL, so the normal at-exit dump never runs).
     // clang -fprofile-generate builds: FO2_PROF_DUMP_SEC=n writes the counters (LLVM_PROFILE_FILE) n seconds after the first
     // frame, since test runs end with SIGKILL. See scripts/build_guest.ps1 -ExtraFlags and docs/NOTES.md.
-    if (__llvm_profile_write_file) {
+    if (fo2ProfileWrite) {
         static const int dumpSec = [] { const char* e = std::getenv("FO2_PROF_DUMP_SEC"); return e ? std::atoi(e) : -1; }();
         static const auto t0 = std::chrono::steady_clock::now();
         static bool dumped = false;
         if (dumpSec > 0 && !dumped && std::chrono::steady_clock::now() - t0 > std::chrono::seconds(dumpSec)) {
             dumped = true;
-            const int rc = __llvm_profile_write_file();
+            const int rc = fo2ProfileWrite();
             std::printf("[FO2] profile counters written (%d) at frame %u\n", rc, frame);
         }
     }
-    if (__gcov_dump) {
+    if (fo2GcovDump) {
         static const int dumpFrame = [] { const char* e = std::getenv("NFSU2_GCOV_DUMP_FRAME"); return e ? std::atoi(e) : -1; }();
-        if (static_cast<int>(frame) == dumpFrame) { __gcov_dump(); std::printf("[NFSU2] guest profile counters written\n"); }
+        if (static_cast<int>(frame) == dumpFrame) { fo2GcovDump(); std::printf("[NFSU2] guest profile counters written\n"); }
     }
     // Diagnostics: NFSU2_SLOW_RACE_MS=n adds n ms to every frame while driving, to see how the game's
     // per-frame work changes when frames are slow (fixed-step simulation catching up?).

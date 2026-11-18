@@ -1,0 +1,87 @@
+--- a/tools/disasm/disasm32.py
++++ b/tools/disasm/disasm32.py
+@@ -78,6 +78,20 @@
+         found.add(code_start + at - (2 if hot else 0))
+         at = data.find(b'\x55\x8B\xEC', at + 1)
+     return found
++
++
++class _CatalogMemory:
++    __slots__ = ("base", "index", "scale", "disp")
++    def __init__(self, mem):
++        self.base, self.index, self.scale, self.disp = mem.base, mem.index, mem.scale, mem.disp
++
++
++class _CatalogOperand:
++    __slots__ = ("type", "imm", "mem")
++    def __init__(self, op):
++        self.type = op.type
++        self.imm = op.imm if op.type == X86_OP_IMM else 0
++        self.mem = _CatalogMemory(op.mem) if op.type == X86_OP_MEM else None
+ 
+ 
+ @dataclass
+@@ -428,15 +442,34 @@
+         if data is None:
+             return
+ 
+-        for insn in decode(self.md, data, va):
+-            yield Instruction(
+-                address=insn.address,
+-                size=insn.size,
+-                mnemonic=insn.mnemonic,
+-                op_str=insn.op_str,
+-                bytes=bytes(insn.bytes),
+-                operands=list(insn.operands) if insn.operands else [],
+-            )
++        cache = getattr(self, "_catalog_cache", None)
++        offset = 0
++        while offset < len(data):
++            address = va + offset
++            if cache is not None and address in cache:
++                item = cache[address]
++                if offset + item.size > len(data):
++                    return
++                yield item
++                offset += item.size
++                continue
++            # Stop decoding when an already decoded instruction is reached;
++            # overlapping function bodies share the same immutable catalog data.
++            for insn in decode(self.md, data[offset:], address):
++                if cache is not None and insn.address in cache:
++                    offset = insn.address - va
++                    break
++                operands = list(insn.operands) if insn.operands else []
++                if cache is not None:
++                    operands = tuple(_CatalogOperand(op) for op in operands)
++                item = Instruction(insn.address, insn.size, insn.mnemonic,
++                                   insn.op_str, bytes(insn.bytes), operands)
++                if cache is not None:
++                    cache[insn.address] = item
++                yield item
++                offset = insn.address + insn.size - va
++            else:
++                return
+ 
+     def jump_table_targets(self, insn, limit: int = 256) -> list:
+         """Entries of the jump table an indirect `jmp` dispatches through.
+@@ -711,6 +744,10 @@
+ 
+         Returns dict of addr -> Function.
+         """
++        # Only catalog callers opt in: lifted-in-process callers still need
++        # complete Capstone operands. Compact shared instructions bound memory
++        # and avoid repeatedly decoding D3DX's overlapping function bodies.
++        self._catalog_cache = {} if release_operands else None
+         print(f"[*] Scanning for call targets in 0x{code_start:08X}-0x{code_end:08X}...")
+         call_targets = self.find_branch_targets(code_start, code_end)
+         print(f"[*] Found {len(call_targets)} potential call targets")
+@@ -879,7 +916,7 @@
+               # `if len(ops) == 2` is false and the instruction vanishes, no
+               # error. That lifts an image to a third of its real size, with the
+               # gotos and every instruction that has an operand quietly missing.
+-              if release_operands:
++              if release_operands and self._catalog_cache is None:
+                   for func in new_funcs:
+                       for b in func.blocks.values():
+                           for ins in b.instructions:

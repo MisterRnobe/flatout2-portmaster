@@ -191,7 +191,7 @@ void wsaSetLastError(){lastError=arg(0);ret(0,1);}
 void socketCreate(){
     uint32_t family=arg(0),type=arg(1),protocol=arg(2);
     if(family==AF_INET&&type==3&&protocol==1){  // SOCK_RAW + IPPROTO_ICMP: ping
-        int fd=::socket(AF_INET,SOCK_DGRAM|SOCK_NONBLOCK|SOCK_CLOEXEC,IPPROTO_ICMP);
+        int fd=::fo2Socket(AF_INET,SOCK_DGRAM|SOCK_NONBLOCK|SOCK_CLOEXEC,IPPROTO_ICMP);
         if(fd<0){
             NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU2","Winsock: ping ICMP no permitido por Android: %s",std::strerror(errno));
             lastError=10013;ret(net::invalidSocket,3);return;  // WSAEACCES, as for a non-admin raw socket on Windows
@@ -204,7 +204,7 @@ void socketCreate(){
         NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU2","Winsock: socket(af=%u,type=%u,protocol=%u) no soportado desde %08x",family,type,protocol,read32(g_esp));
     if(family!=AF_INET){lastError=net::wsaEafnosupport;ret(net::invalidSocket,3);return;}
     if(type!=SOCK_STREAM&&type!=SOCK_DGRAM){lastError=10044;ret(net::invalidSocket,3);return;}  // WSAESOCKTNOSUPPORT
-    int fd=::socket(AF_INET,int(type)|SOCK_NONBLOCK|SOCK_CLOEXEC,int(protocol));
+    int fd=::fo2Socket(AF_INET,int(type)|SOCK_NONBLOCK|SOCK_CLOEXEC,int(protocol));
     if(fd<0){
         NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU2","Winsock: socket(af=%u,type=%u,protocol=%u) fallo: %s",family,type,protocol,std::strerror(errno));
         lastError=net::wsaError(errno);ret(net::invalidSocket,3);return;
@@ -236,7 +236,7 @@ void socketAccept(){
     uint32_t handle=arg(0),address=arg(1),lengthPointer=arg(2);
     auto* socket=net::find(handle);if(!socket){lastError=net::wsaEnotsock;ret(net::invalidSocket,3);return;}
     sockaddr_storage peer{};socklen_t length=sizeof peer;
-    int fd=int(net::blocking(*socket,POLLIN,0,[&](int listener){length=sizeof peer;return ssize_t(::accept4(listener,reinterpret_cast<sockaddr*>(&peer),&length,SOCK_NONBLOCK|SOCK_CLOEXEC));}));
+    int fd=int(net::blocking(*socket,POLLIN,0,[&](int listener){length=sizeof peer;return ssize_t(::fo2Accept4(listener,reinterpret_cast<sockaddr*>(&peer),&length,SOCK_NONBLOCK|SOCK_CLOEXEC));}));
     if(fd<0){lastError=net::wsaError(errno);ret(net::invalidSocket,3);return;}
     if(!net::storeAddress(address,lengthPointer,peer,std::min<socklen_t>(length,16))){::close(fd);lastError=net::wsaEfault;ret(net::invalidSocket,3);return;}
     bool inherit=net::find(handle)?net::find(handle)->guestNonBlocking:false;
@@ -509,7 +509,7 @@ void wsaIoctl(){
         sockaddr_storage target;socklen_t length=net::guestAddress(arg(2),arg(3),target);
         if(!length||target.ss_family!=AF_INET){ret(net::fail(net::wsaEfault),9);return;}
         if(reinterpret_cast<sockaddr_in*>(&target)->sin_port==0)reinterpret_cast<sockaddr_in*>(&target)->sin_port=htons(9);
-        int probe=::socket(AF_INET,SOCK_DGRAM|SOCK_CLOEXEC,0);
+        int probe=::fo2Socket(AF_INET,SOCK_DGRAM|SOCK_CLOEXEC,0);
         if(probe<0){ret(net::failErrno(),9);return;}
         sockaddr_in local{};socklen_t localLength=sizeof local;
         bool ok=::connect(probe,reinterpret_cast<sockaddr*>(&target),length)==0&&::getsockname(probe,reinterpret_cast<sockaddr*>(&local),&localLength)==0;

@@ -1,9 +1,17 @@
+#include "../host/macos_compat.h"
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_opengles2.h>
 
 #include <cstdio>
-extern "C" void __gcov_dump(void) __attribute__((weak));  // libgcov, -fprofile-generate builds only
-extern "C" int __llvm_profile_write_file(void) __attribute__((weak));  // clang profile runtime (pgo_clang_vm.sh gen)
+#ifdef __APPLE__
+static constexpr void (*fo2GcovDump)(void) = nullptr;
+static constexpr int (*fo2ProfileWrite)(void) = nullptr;
+#else
+extern "C" void __gcov_dump(void) FO2_WEAK_IMPORT;  // libgcov, -fprofile-generate builds only
+extern "C" int __llvm_profile_write_file(void) FO2_WEAK_IMPORT;  // clang profile runtime (pgo_clang_vm.sh gen)
+#define fo2GcovDump __gcov_dump
+#define fo2ProfileWrite __llvm_profile_write_file
+#endif
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -431,11 +439,27 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, signalHandler);
 
     std::printf("====================================================\n");
-    std::printf(" Alien Shooter 2 Reloaded - recompiled, Linux ARM64 \n");
+    std::printf(" FlatOut 2 - recompiled, ARM64 \n");
     std::printf(" Game Directory: %s                                \n", config.gameDir.c_str());
     std::printf(" Frame Rate Cap: %u FPS                            \n", config.frameLimit);
     std::printf(" Language:       %s                                \n", config.language.c_str());
     std::printf("====================================================\n");
+
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--check-runtime") == 0) {
+            try {
+                testGuestMemory();
+                std::string exe = gameExeIn(config.gameDir);
+                if (exe.empty()) throw std::runtime_error("FlatOut2.exe not found");
+                const std::string status = connectGuestRuntime(exe.c_str(), true);
+                std::printf("%s\n", status.c_str());
+                return status == "Runtime check passed" ? 0 : 1;
+            } catch (const std::exception& ex) {
+                std::fprintf(stderr, "Runtime check failed: %s\n", ex.what());
+                return 1;
+            }
+        }
+    }
 
     // Initialize SDL2
     Uint32 sdlFlags = SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER | SDL_INIT_JOYSTICK;
@@ -446,12 +470,14 @@ int main(int argc, char** argv) {
     nfsInstallCrashHandler();   // after SDL_Init: the report goes to the log
     chooseResolution(config);
     g_nfsScreenRotation = config.rotation;
+#ifndef __APPLE__
     {
         // set by ports/r36s/compat/glibc_compat.c (absent in builds linked without it)
-        extern int compat_newer_libm __attribute__((weak));
+        extern int compat_newer_libm FO2_WEAK_IMPORT;
         if (&compat_newer_libm)
             std::printf("[NFSU2] glibc compat: %s libm functions\n", compat_newer_libm ? "newer" : "GLIBC_2.17");
     }
+#endif
     std::printf("[NFSU2] screen %ux%u%s, game renders %ux%u (%s)\n", config.screenWidth, config.screenHeight,
                 config.rotation == 90 ? " rotated 90" : (config.rotation == 270 ? " rotated 270" : ""),
                 config.targetWidth, config.targetHeight,
@@ -494,7 +520,7 @@ int main(int argc, char** argv) {
     Uint32 windowFlags = SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN;
 
     g_window = SDL_CreateWindow(
-        "Alien Shooter 2: Reloaded",
+        "FlatOut 2",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         static_cast<int>(config.screenWidth), static_cast<int>(config.screenHeight),
         windowFlags
@@ -504,7 +530,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "SDL window with an alpha channel failed (%s); retrying without\n", SDL_GetError());
         SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 0);
         g_window = SDL_CreateWindow(
-            "Alien Shooter 2: Reloaded",
+            "FlatOut 2",
             SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
             static_cast<int>(config.screenWidth), static_cast<int>(config.screenHeight),
             windowFlags
@@ -726,11 +752,11 @@ int main(int argc, char** argv) {
         {
             static const uint32_t gcovFrame = getenv("NFSU2_GCOV_DUMP") ? static_cast<uint32_t>(atoi(getenv("NFSU2_GCOV_DUMP"))) : 0;
             static bool written = false;
-            if (gcovFrame && !written && getD3D9PresentCount() >= gcovFrame && (__gcov_dump || __llvm_profile_write_file)) {
+            if (gcovFrame && !written && getD3D9PresentCount() >= gcovFrame && (fo2GcovDump || fo2ProfileWrite)) {
                 written = true;
                 std::printf("[NFSU2] writing profile counters (frame %u)\n", getD3D9PresentCount()); std::fflush(stdout);
-                if (__gcov_dump) __gcov_dump();
-                if (__llvm_profile_write_file) __llvm_profile_write_file();
+                if (fo2GcovDump) fo2GcovDump();
+                if (fo2ProfileWrite) fo2ProfileWrite();
                 std::printf("[NFSU2] profile counters written\n"); std::fflush(stdout);
             }
         }

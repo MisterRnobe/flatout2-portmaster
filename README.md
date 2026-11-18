@@ -2,6 +2,9 @@
 
 # FlatOut 2 for ARM64 handhelds
 
+**Apple Silicon macOS:** see [MACOS.md](MACOS.md) for the native build and launcher.
+
+
 FlatOut 2 (PC) statically recompiled to native ARM64 Linux, as a PortMaster-style port. You provide the game files, the port does the rest: nothing to compile.
 
 **Transparency:** this port was developed entirely with Claude, Anthropic's AI, which wrote the code. My own part was testing it on real consoles, analysing the results and proposing improvements.

@@ -4,6 +4,10 @@
 #include <cstring>
 #include <stdexcept>
 #include <sys/mman.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
 #include <unistd.h>
 #include <map>
 #include <algorithm>
@@ -40,7 +44,17 @@ public:
         // Lifted code compiled with NFS_FIXED_GUEST_BASE adds this constant to every guest address
         // (arm64_guest.h): the reservation must land exactly there.
         void* want = reinterpret_cast<void*>(static_cast<uintptr_t>(NFS_FIXED_GUEST_BASE));
+#ifdef __APPLE__
+        // Darwin may ignore mmap's address hint. A fixed Mach allocation fails
+        // if any part is occupied; unlike MAP_FIXED it never replaces a mapping.
+        mach_vm_address_t address = reinterpret_cast<uintptr_t>(want);
+        const kern_return_t status = mach_vm_map(mach_task_self(), &address, size,
+            0, VM_FLAGS_FIXED, MEMORY_OBJECT_NULL, 0, FALSE, VM_PROT_NONE,
+            VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE);
+        base_ = status == KERN_SUCCESS ? reinterpret_cast<void*>(address) : MAP_FAILED;
+#else
         base_ = mmap(want, size_t(size), PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+#endif
         if (base_ != MAP_FAILED && base_ != want) { munmap(base_, size_t(size)); base_ = MAP_FAILED; }
         if (base_ == MAP_FAILED) throw std::runtime_error("Guest address space could not be reserved at the fixed base");
 #else

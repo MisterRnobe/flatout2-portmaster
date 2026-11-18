@@ -289,8 +289,18 @@ void getAdaptersInfo(){
     auto* out=static_cast<char*>(ptr(arg(0),size));std::memset(out,0,size);
     std::snprintf(out+8,260,"%s",found->ifa_name);std::snprintf(out+268,132,"%s",found->ifa_name);
     write32(arg(0)+400,6);
-    int query=::socket(AF_INET,SOCK_DGRAM|SOCK_CLOEXEC,0);ifreq request{};std::snprintf(request.ifr_name,IFNAMSIZ,"%s",found->ifa_name);
+#ifndef __APPLE__
+    int query=::fo2Socket(AF_INET,SOCK_DGRAM|SOCK_CLOEXEC,0);ifreq request{};std::snprintf(request.ifr_name,IFNAMSIZ,"%s",found->ifa_name);
     if(query>=0){if(::ioctl(query,SIOCGIFHWADDR,&request)==0)std::memcpy(out+404,request.ifr_hwaddr.sa_data,6);::close(query);}
+#else
+    for(const ifaddrs* i=list;i;i=i->ifa_next){
+        if(i->ifa_addr && i->ifa_addr->sa_family==AF_LINK && std::strcmp(i->ifa_name,found->ifa_name)==0){
+            const auto* link=reinterpret_cast<const sockaddr_dl*>(i->ifa_addr);
+            if(link->sdl_alen==6)std::memcpy(out+404,LLADDR(link),6);
+            break;
+        }
+    }
+#endif
     write32(arg(0)+412,1);write32(arg(0)+416,6);write32(arg(0)+424,arg(0)+428);
     char text[INET_ADDRSTRLEN]{};
     inet_ntop(AF_INET,&reinterpret_cast<const sockaddr_in*>(found->ifa_addr)->sin_addr,text,sizeof text);std::snprintf(out+432,16,"%s",text);

@@ -14,7 +14,7 @@ NFSU2's own notes follow.
       function's BASIC BLOCK ranges, so lifting can re-decode without paying
       for the whole discovery again (it takes ~12 minutes on SPEED2.EXE).
 
-  run_lift.py lift  <analysis.exe> <catalog.json> <outdir> [--split N] [--names names.json] [--prefix P]
+  run_lift.py lift  <analysis.exe> <catalog.json> <outdir> [--split N] [--names names.json] [--prefix P] [--bounded]
       Lift every catalogued function with lift32.Lifter and write:
         recomp_NNNN.c          the functions, N per file
         recomp_funcs.h         declarations
@@ -91,7 +91,7 @@ def cmd_catalog(exe, seeds_path, out):
     print(f"[*] wrote {out}")
 
 
-def rebuild(md, img, base, fd):
+def rebuild(md, img, base, fd, bounded=False):
     """A disasm32.Function with full capstone operands, from a catalog entry."""
     f = Function(address=fd["address"], end=fd["end"], size=fd["size"],
                  name=f"sub_{fd['address']:08X}", is_thunk=fd["is_thunk"],
@@ -99,6 +99,10 @@ def rebuild(md, img, base, fd):
     f.jump_targets = set(fd["jump_targets"])
     f.calls_to = set(fd["calls_to"])
     for s, e, succ, ex in fd["blocks"]:
+        if bounded:
+            s, e = max(s, fd["address"]), min(e, fd["end"])
+            if s >= e:
+                continue
         b = BasicBlock(start=s, end=e, successors=list(succ), is_exit=bool(ex))
         for ins in md.disasm(img[s - base:e - base], s):
             mnemonic = ins.mnemonic
@@ -108,6 +112,15 @@ def rebuild(md, img, base, fd):
             b.instructions.append(Instruction(ins.address, ins.size, mnemonic,
                                               ins.op_str, bytes(ins.bytes),
                                               list(ins.operands)))
+        if bounded and b.instructions and e == fd["end"]:
+            last = b.instructions[-1]
+            if not (last.is_ret or last.is_uncond_jump):
+                # A clipped fallthrough must enter the next guest function;
+                # returning from C here would leave the guest stack unbalanced.
+                from types import SimpleNamespace
+                from capstone.x86 import X86_OP_IMM
+                b.instructions.append(Instruction(e, 0, "jmp", f"0x{e:x}", b"",
+                    [SimpleNamespace(type=X86_OP_IMM, imm=e)]))
         f.blocks[s] = b
     return f
 
@@ -125,7 +138,7 @@ def va_list(name):
     return out
 
 
-def cmd_lift(exe, catalog, outdir, split=400, names_path=None, prefix=""):
+def cmd_lift(exe, catalog, outdir, split=400, names_path=None, prefix="", bounded=False):
     import pefile
     from lift32 import Lifter
     info = analyze_pe(exe)
@@ -209,7 +222,7 @@ def cmd_lift(exe, catalog, outdir, split=400, names_path=None, prefix=""):
                         f"void sub_{a:08X}(void) {{ RECOMP_UNIMPL(0x{a:08X}u, \"excluded: not code\"); }}")
                 stats["excluded"] += 1
             else:
-                f = rebuild(md, img, base, fd)
+                f = rebuild(md, img, base, fd, bounded=bounded)
                 code = lifter.lift_function(f)
                 for old, new in call_rewrites:
                     if old in code:
@@ -281,6 +294,6 @@ if __name__ == "__main__":
         split = int(a[a.index("--split") + 1]) if "--split" in a else 400
         names = a[a.index("--names") + 1] if "--names" in a else None
         prefix = a[a.index("--prefix") + 1] if "--prefix" in a else ""
-        cmd_lift(a[1], a[2], a[3], split, names, prefix)
+        cmd_lift(a[1], a[2], a[3], split, names, prefix, bounded="--bounded" in a)
     else:
         sys.exit(__doc__)

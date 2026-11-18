@@ -1,0 +1,53 @@
+--- a/tools/lift/lift32.py
++++ b/tools/lift/lift32.py
+@@ -1685,7 +1685,7 @@
+         # compare never ran (so _fpu_cmp kept its last value) and its two pops
+         # never happened, leaking two x87 slots per call. The Movies has 3,244
+         # of them; its audio code read every position/length ratio as 1.0.
+-        elif m in ('fcomip', 'fucomip', 'fcompp', 'fucompp'):
++        elif m in ('fcompp', 'fucompp'):
+             lines.append(f"_fpu_cmp = FPU_CMP(_st[0], _st[1]); {comment}")
+             if m in ('fcompp', 'fucompp'):
+                 lines.append(f"fp_pop(); fp_pop();")
+@@ -1694,6 +1694,18 @@
+             lines.append("_flag_a = (uint32_t)_fpu_cmp; _flag_b = 0;")
+             self._flag_state = ('fcom', '_fpu_cmp')
+             self._flag_seq += 1
++
++        elif m in ('fcomi', 'fucomi', 'fcompi', 'fucompi', 'fcomip', 'fucomip'):
++            src = self._fmt_fpu_src(ops)
++            lines.append(f"{{ int cmp = FPU_CMP(_st[0], {src}); _flag_a = cmp == -1 ? 1u : cmp == 0 ? 64u : cmp == 1 ? 0u : 69u; _flag_b = 0; _cf = _flag_a & 1u; }} {comment}")
++            if m in ('fcompi', 'fucompi', 'fcomip', 'fucomip'):
++                lines.append("fp_pop();")
++            self._flag_state = ('eflags', '_flag_a, _flag_b')
++            self._flag_seq += 1
++
++        elif m in ('fcmovb', 'fcmove', 'fcmovbe', 'fcmovu', 'fcmovnb', 'fcmovne', 'fcmovnbe', 'fcmovnu'):
++            cc = {'fcmovb':'jb', 'fcmove':'je', 'fcmovbe':'jbe', 'fcmovu':'jp', 'fcmovnb':'jae', 'fcmovne':'jne', 'fcmovnbe':'ja', 'fcmovnu':'jnp'}[m]
++            lines.append(f"if ({self._make_condition(cc)}) _st[0] = {self._fmt_fpu_src(ops)}; {comment}")
+ 
+         elif m in ('fcom', 'fcomp', 'fucom', 'fucomp'):
+             if ops:
+@@ -1982,13 +1994,19 @@
+             t = ops[0].imm if ops and ops[0].type == X86_OP_IMM else None
+             reg = 'ecx' if m == 'jecxz' else 'LO16(ecx)'
+             if t is not None:
+-                lines.append(f"if ({reg} == 0) goto L_{t:08X}; {comment}")
++                if self._labels is not None and t not in self._labels:
++                    lines.append(f"if ({reg} == 0) {{ RECOMP_ITAIL(0x{t:08X}u); return; }} {comment}")
++                else:
++                    lines.append(f"if ({reg} == 0) goto L_{t:08X}; {comment}")
+ 
+         elif m in ('loop', 'loope', 'loopne'):
+             t = ops[0].imm if ops and ops[0].type == X86_OP_IMM else None
+-            extra = {'loop': '', 'loope': ' && _cf == 0', 'loopne': ' && _cf == 0'}[m]
++            extra = '' if m == 'loop' else f" && ({self._make_condition('je' if m == 'loope' else 'jne')})"
+             if t is not None:
+-                lines.append(f"if (--ecx != 0{extra}) goto L_{t:08X}; {comment}")
++                if self._labels is not None and t not in self._labels:
++                    lines.append(f"if (--ecx != 0{extra}) {{ RECOMP_ITAIL(0x{t:08X}u); return; }} {comment}")
++                else:
++                    lines.append(f"if (--ecx != 0{extra}) goto L_{t:08X}; {comment}")
+ 
+         elif m == 'scasd':
+             lines.append(f"_flag_a = eax; _flag_b = MEM32(edi); _flag_k = FK_CMP; "
