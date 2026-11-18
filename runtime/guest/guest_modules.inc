@@ -134,3 +134,37 @@ void bindGuestModuleImports(){
         NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","%zu imports bound to lifted DLL exports",pendingModuleImports.size());
     pendingModuleImports.clear();
 }
+
+// Headless shader compilation exercises the lifted D3DX parser/code generator,
+// not merely DllMain. No SDL window or D3D device is needed.
+void testLiftedD3DXCompiler(){
+#ifdef FO2_D3DX_LIFTED
+    uint32_t compile=0;
+    if(!guestModuleExport(guestModuleHandle("d3dx9_30.dll"),"D3DXCompileShader",compile))
+        throw GuestStop("D3DXCompileShader export missing");
+    const uint32_t outputs=allocate(16);
+    auto bufferPointer=[](uint32_t buffer){return callGuest(read32(read32(buffer)+12),{buffer});};
+    auto release=[](uint32_t buffer){if(buffer)callGuest(read32(read32(buffer)+8),{buffer});};
+    for(const auto& test:std::vector<std::pair<const char*,const char*>>{
+        {"vs_2_0","float4 main(float4 p : POSITION) : POSITION { return p; }"},
+        {"ps_2_0","float4 main() : COLOR0 { return float4(1,0.25,0.5,1); }"}}){
+        uint32_t source=fo2::guestDup(test.second),profile=fo2::guestDup(test.first),entryName=fo2::guestDup("main");
+        for(unsigned i=0;i<12;i+=4)write32(outputs+i,0);
+        write32(outputs+12,0xfeedc0de);
+        NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","D3DX compiling headless %s shader",test.first);
+        uint32_t result=callGuest(compile,{source,uint32_t(std::strlen(test.second)),0,0,entryName,profile,0,outputs,outputs+4,outputs+8});
+        uint32_t shader=read32(outputs),errors=read32(outputs+4),constants=read32(outputs+8);
+        std::string error=errors?guestString(bufferPointer(errors)):"no compiler diagnostic";
+        if(int32_t(result)<0||!shader)throw GuestStop("D3DX shader compile failed: "+hex(result)+" "+error);
+        uint32_t bytes=callGuest(read32(read32(shader)+16),{shader});
+        uint32_t version=read32(bufferPointer(shader));
+        const uint32_t expected=test.first[0]=='v'?0xfffe0200u:0xffff0200u;
+        if(bytes<8||version!=expected||read32(outputs+12)!=0xfeedc0de)
+            throw GuestStop("D3DX shader buffer or output guard failed");
+        release(shader);release(errors);release(constants);
+        for(uint32_t allocation:{source,profile,entryName})heaps->free(GuestHeaps::process,allocation);
+    }
+    heaps->free(GuestHeaps::process,outputs);
+    NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Lifted D3DX vertex/pixel shader compilation passed (bytecode, guards, COM buffers and stack cleanup)");
+#endif
+}

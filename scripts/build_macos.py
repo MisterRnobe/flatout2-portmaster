@@ -24,7 +24,7 @@ guestflags=defs(['NFS_FIXED_GUEST_BASE=0x10000000000ULL','RECOMP_TLS=__thread','
 if '--host-only' not in sys.argv:
     # D3DX is cold shader/compiler code; keep its x87 stack global rather than
     # applying local-window guesses across the recovered alias boundaries.
-    units += [(p,[f for f in guestflags if f != '-DNFS_X87_LW'] if p.name.startswith('d3dx_') else guestflags) for p in gen.glob('*recomp_*.c')]
+    units += [(p,[f for f in guestflags if f != '-DNFS_X87_LW']+['-DNFS_NATIVE_TAIL'] if p.name.startswith('d3dx_') else guestflags) for p in gen.glob('*recomp_*.c')]
 def compile_unit(unit):
     src,flags=unit; dest=obj/(src.stem+'.o'); log=obj/(src.stem+'.log')
     deps=[src,Path(__file__),rt/'guest/arm64_guest.h',rt/'host/macos_compat.h',*list((out/'include').glob('*.h')),*list(gen.glob('*.h'))]

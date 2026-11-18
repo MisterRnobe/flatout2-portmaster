@@ -49,6 +49,14 @@ static inline void nfs_guest_cpuid(uint32_t leaf) {
 #undef CPUID
 #define CPUID(a,b,c,d) do { RECOMP_REGS_OUT(); nfs_guest_cpuid((a)); RECOMP_REGS_IN(); } while (0)
 
+// A guest JMP must not accumulate native call frames. D3DX has loops split
+// into recovered entries; normal C calls exhausted even a 64 MB worker stack.
+#ifdef NFS_NATIVE_TAIL
+#define NFS_TAIL_TRANSFER(fn) __attribute__((musttail)) return (fn)()
+#else
+#define NFS_TAIL_TRANSFER(fn) do { (fn)(); RECOMP_REGS_IN(); } while (0)
+#endif
+
 // Indirect calls (vtables, function pointers): each call site keeps the last target it resolved through
 // the lifted-function table (a per-site monomorphic inline cache), so a repeated call skips the three
 // lookups (overrides, hash, imports). Only recomp_lookup hits are cached: they are pure; the override
@@ -130,7 +138,7 @@ recomp_func_t recomp_lookup_cacheable(uint32_t va);
     NFS_ICALL_COUNT(); \
     recomp_func_t _fn; \
     NFS_ICALL_RESOLVE(_va, _fn); \
-    if (_fn) { RECOMP_FLAGS_OUT(); RECOMP_REGS_OUT(); nfs_icall_va = _va; _fn(); RECOMP_REGS_IN(); } \
+    if (_fn) { RECOMP_FLAGS_OUT(); RECOMP_REGS_OUT(); nfs_icall_va = _va; NFS_TAIL_TRANSFER(_fn); } \
     else if (_va == RECOMP_RETADDR) { } \
     else { RECOMP_MISS("ITAIL", _va); } \
 } while(0)
