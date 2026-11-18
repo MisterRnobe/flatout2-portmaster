@@ -6,6 +6,7 @@
 // gethostbyname also carries the community-server redirect (what the PC
 // "eanationhub.asi" mod does): any *.ea.com name resolves onlineServer instead.
 #include "socket_address.h"
+#include "socket_poll.h"
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 #include <net/if.h>
@@ -23,7 +24,7 @@ constexpr uint32_t wsaEinval=10022,wsaEwouldblock=10035,wsaEnotsock=10038,wsaEfa
     wsaEtimedout=10060,wsaEafnosupport=10047,wsaNotinitialised=10093,wsaHostNotFound=11001,wsaNoData=11004;
 constexpr char localHostName[]="nfsu2-android";
 // icmp: a Windows raw ICMP socket (ping) on an unprivileged Linux ping socket; see icmpReceive.
-struct Socket{uint32_t traceSend=0,traceRecv=0;int fd;bool guestNonBlocking=false,connecting=false,icmp=false;uint16_t icmpId=0;uint32_t recvTimeout=0,sendTimeout=0;std::set<std::string> peersLogged;
+struct Socket{uint32_t traceSend=0,traceRecv=0;int fd;int connectError=0;bool guestNonBlocking=false,connecting=false,icmp=false;uint16_t icmpId=0;uint32_t recvTimeout=0,sendTimeout=0;std::set<std::string> peersLogged;
     struct Counter{uint32_t sentPackets=0,sentBytes=0,receivedPackets=0,receivedBytes=0;};
     std::map<std::string,Counter> traffic;std::chrono::steady_clock::time_point nextSummary{};};
 std::map<uint32_t,Socket> sockets;
@@ -270,6 +271,7 @@ void socketConnect(){
     if(!length){ret(net::fail(net::wsaEfault),3);return;}
     auto* in=reinterpret_cast<sockaddr_in*>(&address);char text[INET_ADDRSTRLEN]{};inet_ntop(AF_INET,&in->sin_addr,text,sizeof text);
     NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Winsock: connect %08x to %s:%u",handle,text,ntohs(in->sin_port));
+    socket->connectError=0;
     if(::connect(socket->fd,reinterpret_cast<sockaddr*>(&address),length)==0){ret(0,3);return;}
     if(errno!=EINPROGRESS){
         const int error=errno;
@@ -415,7 +417,10 @@ void socketGetOption(){
     int option=0;socklen_t size=sizeof option;int status=0;
     if(level==0xffffu){
         switch(name){
-        case 0x1007:status=::getsockopt(socket->fd,SOL_SOCKET,SO_ERROR,&option,&size);if(!status)option=option?int(net::wsaError(option)):0;break;
+        case 0x1007:
+            if(socket->connectError){option=int(net::wsaError(socket->connectError));socket->connectError=0;}
+            else {status=::getsockopt(socket->fd,SOL_SOCKET,SO_ERROR,&option,&size);if(!status)option=option?int(net::wsaError(option)):0;}
+            break;
         case 0x1008:status=::getsockopt(socket->fd,SOL_SOCKET,SO_TYPE,&option,&size);break;  // SOCK_STREAM/DGRAM match
         case 0x1001:status=::getsockopt(socket->fd,SOL_SOCKET,SO_SNDBUF,&option,&size);break;
         case 0x1002:status=::getsockopt(socket->fd,SOL_SOCKET,SO_RCVBUF,&option,&size);break;
@@ -437,15 +442,15 @@ void hostToNetShort(){ret(__builtin_bswap16(uint16_t(arg(0))),1);}
 void socketSelect(){
     uint32_t sets[3]={arg(1),arg(2),arg(3)},timeoutPointer=arg(4);
     static constexpr short wanted[3]={POLLIN,POLLOUT,POLLPRI};
-    struct Entry{uint32_t handle;int fd;unsigned set;};
-    std::vector<Entry> entries;std::vector<pollfd> polls;
+    struct Entry{uint32_t handle;int fd;unsigned set;size_t pollIndex;};
+    std::vector<Entry> entries;fo2net::PollSet pollSet;auto& polls=pollSet.items;
     for(unsigned set=0;set<3;++set){
         if(!sets[set])continue;
         uint32_t count=read32(sets[set]);if(count>64){ret(net::fail(net::wsaEinval),5);return;}
         for(uint32_t i=0;i<count;++i){
             uint32_t handle=read32(sets[set]+4+i*4);auto* socket=net::find(handle);
             if(!socket){ret(net::fail(net::wsaEnotsock),5);return;}
-            entries.push_back({handle,socket->fd,set});polls.push_back({socket->fd,wanted[set],0});
+            entries.push_back({handle,socket->fd,set,pollSet.add(socket->fd,wanted[set])});
         }
     }
     if(entries.empty()){ret(net::fail(net::wsaEinval),5);return;}
@@ -463,19 +468,21 @@ void socketSelect(){
         if(ready<0&&errno==EINTR)ready=0;
     }
     if(ready<0){ret(net::failErrno(),5);return;}
-    std::vector<uint32_t> hits[3];
-    for(size_t i=0;i<entries.size();++i){
-        auto& entry=entries[i];short events=polls[i].revents;auto* socket=net::find(entry.handle);
-        bool hit=false;
-        if(entry.set==0)hit=events&(POLLIN|POLLHUP|POLLERR);
-        else if(socket&&socket->connecting&&(events&(POLLOUT|POLLERR|POLLHUP))){
-            // A pending non-blocking connect is writable on success, "except" on failure.
-            int error=0;socklen_t size=sizeof error;::getsockopt(entry.fd,SOL_SOCKET,SO_ERROR,&error,&size);
-            hit=entry.set==1?!error:error!=0;
-            if(hit)socket->connecting=false;
+    // SO_ERROR is consumptive. Resolve each pending connection once, before
+    // projecting its readiness into the independent Windows fd_sets.
+    std::map<uint32_t,int> completed;
+    for(const auto& entry:entries){
+        auto* socket=net::find(entry.handle);short events=polls[entry.pollIndex].revents;
+        if(socket&&socket->connecting&&(events&(POLLOUT|POLLERR|POLLHUP))){
+            int error=0;socklen_t size=sizeof error;
+            if(::getsockopt(entry.fd,SOL_SOCKET,SO_ERROR,&error,&size))error=errno;
+            completed[entry.handle]=error;socket->connectError=error;socket->connecting=false;
         }
-        else if(entry.set==1)hit=events&POLLOUT;
-        else hit=events&POLLPRI;
+    }
+    std::vector<uint32_t> hits[3];
+    for(const auto& entry:entries){
+        auto result=completed.find(entry.handle);
+        bool hit=fo2net::selectReady(entry.set,polls[entry.pollIndex].revents,result!=completed.end(),result==completed.end()?0:result->second);
         if(hit&&std::find(hits[entry.set].begin(),hits[entry.set].end(),entry.handle)==hits[entry.set].end())hits[entry.set].push_back(entry.handle);
     }
     uint32_t total=0;
@@ -633,4 +640,26 @@ void testGuestSocketAddresses(){
        net::guestAddress(input,15,native))throw GuestStop("Guest socket address short-buffer check failed");
     heaps->free(GuestHeaps::process,data);
     NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Guest Winsock address ABI passed: IPv4, port, roundtrip, output length and guards");
+}
+
+// Reproduce the server browser's read+exception fd_sets on one stream without
+// an internet connection. This exercises the real HLE select and recv calls.
+void testGuestSocketSelect(){
+    int pair[2];if(::socketpair(AF_UNIX,SOCK_STREAM,0,pair))throw GuestStop("Socket select test socketpair failed");
+    uint32_t handle=net::newHandle(pair[0],true),data=allocate(128);
+    uint32_t selectVA=importBase+uint32_t(imports.size())*16;
+    imports.push_back({"selftest!select",socketSelect});
+    uint32_t recvVA=importBase+uint32_t(imports.size())*16;
+    imports.push_back({"selftest!recv",socketRecv});
+    write32(data,1);write32(data+4,handle); // read fd_set
+    write32(data+32,1);write32(data+36,handle); // same socket in exception fd_set
+    write32(data+64,0);write32(data+68,0); // nonblocking select
+    constexpr char reply[]="openspy-response";
+    if(::write(pair[1],reply,sizeof reply)!=sizeof reply)throw GuestStop("Socket select test write failed");
+    if(callGuest(selectVA,{0,data,0,data+32,data+64})!=1||read32(data)!=1||read32(data+4)!=handle||read32(data+32)!=0)
+        throw GuestStop("Guest select lost stream response with duplicate read/exception socket");
+    if(callGuest(recvVA,{handle,data+80,sizeof reply,0})!=sizeof reply||std::memcmp(ptr(data+80,sizeof reply),reply,sizeof reply))
+        throw GuestStop("Guest stream recv after select failed");
+    ::close(pair[0]);::close(pair[1]);net::sockets.erase(handle);heaps->free(GuestHeaps::process,data);
+    NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Guest select/recv passed: one stream in read+exception sets, response bytes and guest stack cleanup");
 }

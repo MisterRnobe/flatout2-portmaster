@@ -5,7 +5,7 @@ from pathlib import Path
 import subprocess
 ROOT=Path(__file__).resolve().parents[1]
 parser=argparse.ArgumentParser()
-parser.add_argument('--offline',action='store_true',help='Only ABI tests; no sockets')
+parser.add_argument('--offline',action='store_true',help='ABI and local stream tests; no external network')
 parser.add_argument('--openspy',action='store_true',help='Also resolve/connect to the OpenSpy master; no server-list request')
 args=parser.parse_args()
 if args.offline and args.openspy:parser.error('--offline and --openspy are mutually exclusive')

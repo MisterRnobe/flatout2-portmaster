@@ -1,4 +1,5 @@
 #include "socket_address.h"
+#include "socket_poll.h"
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <unistd.h>
@@ -29,7 +30,30 @@ static sockaddr_storage roundtrip(const sockaddr_storage& native){
     for(unsigned i=0;i<4;++i)require(guest[i]==0xa5&&guest[i+20]==0xa5,"address guards");
     sockaddr_storage out{};require(fo2net::decodeAddress(guest.data()+4,16,out)==16,"decode address");return out;
 }
+static void pollABI(){
+    int descriptors[2];require(socketpair(AF_UNIX,SOCK_STREAM,0,descriptors)==0,"socketpair");
+    const int input=descriptors[0],output=descriptors[1];
+    require(write(output,"reply",5)==5,"socketpair write");
+    pollfd old[2]={{input,POLLIN,0},{input,POLLPRI,0}};
+    const int oldReady=::poll(old,2,0);
+    fo2net::PollSet merged;
+    auto read=merged.add(input,POLLIN),except=merged.add(input,POLLPRI);
+    require(read==except&&merged.items.size()==1,"one descriptor per socket");
+    require(::poll(merged.items.data(),merged.items.size(),0)==1,"merged poll sees response");
+    require(fo2net::selectReady(0,merged.items[read].revents,false,0),"response is readable");
+    require(!fo2net::selectReady(2,merged.items[except].revents,false,0),"response is not an exception");
+    char bytes[5];require(::read(input,bytes,5)==5&&!std::memcmp(bytes,"reply",5),"response remains readable");
+    require(::poll(merged.items.data(),merged.items.size(),0)==0,"drained descriptor not ready");
+    close(output);
+    require(::poll(merged.items.data(),merged.items.size(),0)==1&&fo2net::selectReady(0,merged.items[0].revents,false,0),"EOF is readable");
+    close(input);
+    require(fo2net::selectReady(2,POLLERR,true,ECONNREFUSED)&&!fo2net::selectReady(1,POLLOUT|POLLERR,true,ECONNREFUSED)&&
+            !fo2net::selectReady(0,POLLERR,true,ECONNREFUSED),"failed connect is exception only");
+    require(fo2net::selectReady(1,POLLOUT,true,0)&&!fo2net::selectReady(2,POLLOUT,true,0),"successful connect is writable");
+    std::printf("PASS select/poll: merged descriptor masks, readable response, EOF and connection results (unmerged native poll ready=%d)\n",oldReady);
+}
 static void offline(){
+    pollABI();
     uint8_t guest[16]={2,0,0x70,0xee,192,0,2,7};sockaddr_storage native{};
     require(fo2net::decodeAddress(guest,16,native)==16,"golden IPv4 decode");
     const auto& in=*reinterpret_cast<const sockaddr_in*>(&native);

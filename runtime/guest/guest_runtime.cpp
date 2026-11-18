@@ -1324,6 +1324,7 @@ std::string connectGuestRuntime(const char* executable, bool checkOnly) {
         bindGuestModuleImports();   // d3dx9_30.dll: mapped, DllMain run, the exe's IAT slots pointed at its exports
         if (checkOnly) {
             testGuestSocketAddresses();
+            testGuestSocketSelect();
             testLiftedD3DXCompiler();
             joinGuestThreads(guard);machineLease=nullptr;shutdownGuestSound();
 #if defined(__ANDROID__) || defined(NFS_D3D9_BACKEND)
