@@ -33,3 +33,6 @@ shaderdump/
 # Python build helpers
 __pycache__/
 *.pyc
+
+# Local transfer helper contains the personal sync-folder path.
+/CopyToYandex.command
