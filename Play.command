@@ -22,4 +22,4 @@ if p.exists() and size:
         struct.pack_into('<III', data, 120, w, h, 32)
         p.write_bytes(data)
 PYCFG
-exec ./work/macos/fo2 "$PWD/gamedata" --windowed --cap60 "$@" > >(tee work/macos/play.log) 2>&1
+./work/macos/fo2 "$PWD/gamedata" --windowed --cap60 "$@" 2>&1 | tee work/macos/play.log
