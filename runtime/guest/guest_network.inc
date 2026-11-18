@@ -23,7 +23,7 @@ constexpr uint32_t wsaEinval=10022,wsaEwouldblock=10035,wsaEnotsock=10038,wsaEfa
     wsaEtimedout=10060,wsaEafnosupport=10047,wsaNotinitialised=10093,wsaHostNotFound=11001,wsaNoData=11004;
 constexpr char localHostName[]="nfsu2-android";
 // icmp: a Windows raw ICMP socket (ping) on an unprivileged Linux ping socket; see icmpReceive.
-struct Socket{int fd;bool guestNonBlocking=false,connecting=false,icmp=false;uint16_t icmpId=0;uint32_t recvTimeout=0,sendTimeout=0;std::set<std::string> peersLogged;
+struct Socket{uint32_t traceSend=0,traceRecv=0;int fd;bool guestNonBlocking=false,connecting=false,icmp=false;uint16_t icmpId=0;uint32_t recvTimeout=0,sendTimeout=0;std::set<std::string> peersLogged;
     struct Counter{uint32_t sentPackets=0,sentBytes=0,receivedPackets=0,receivedBytes=0;};
     std::map<std::string,Counter> traffic;std::chrono::steady_clock::time_point nextSummary{};};
 std::map<uint32_t,Socket> sockets;
@@ -96,7 +96,27 @@ bool storeAddress(uint32_t address,uint32_t lengthPointer,const sockaddr_storage
 }
 uint32_t newHandle(int fd,bool nonBlocking){
     uint32_t handle=nextHandle;nextHandle+=4;
-    sockets[handle]=Socket{fd,nonBlocking};return handle;
+    Socket value{};value.fd=fd;value.guestNonBlocking=nonBlocking;sockets[handle]=std::move(value);return handle;
+}
+bool traceEnabled(){static const bool enabled=std::getenv("FO2_NET_TRACE")!=nullptr;return enabled;}
+void traceStream(uint32_t handle,Socket& socket,bool sent,const void* data,uint32_t requested,ssize_t result,int error,uint32_t flags){
+    if(!traceEnabled())return;
+    int type=0;socklen_t size=sizeof type;
+    if(::getsockopt(socket.fd,SOL_SOCKET,SO_TYPE,&type,&size)||type!=SOCK_STREAM)return;
+    auto& sequence=sent?socket.traceSend:socket.traceRecv;
+    const uint32_t packet=sequence++;
+    if(packet>=32)return;
+    NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","NET TRACE %s socket=%08x requested=%u result=%lld errno=%d WSA=%u flags=%x",sent?"send":"recv",handle,requested,static_cast<long long>(result),result<0?error:0,result<0?wsaError(error):0,flags);
+    if(result<=0)return;
+    sockaddr_in peer{};size=sizeof peer;
+    if(::getpeername(socket.fd,reinterpret_cast<sockaddr*>(&peer),&size)||ntohs(peer.sin_port)!=28910)return;
+    // Capture only GameSpy master-list traffic, bounded to 32 calls per socket.
+    const std::filesystem::path folder=std::filesystem::path("work/macos/network-trace")/std::to_string(getpid());
+    std::error_code ec;std::filesystem::create_directories(folder,ec);
+    char name[64];std::snprintf(name,sizeof name,"%08x-%s-%03u.bin",handle,sent?"send":"recv",packet);
+    std::ofstream capture(folder/name,std::ios::binary);
+    capture.write(static_cast<const char*>(data),std::min<ssize_t>(result,65536));
+    if(capture)NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","NET TRACE captured %s",(folder/name).string().c_str());
 }
 uint16_t checksum(const uint8_t* data,size_t length){
     uint32_t sum=0;
@@ -272,7 +292,9 @@ void socketSend(){
     const void* data=length?ptr(buffer,length):nullptr;
     net::noteIcmpSend(*socket,data,length);
     ssize_t sent=net::blocking(*socket,POLLOUT,socket->sendTimeout,[&](int fd){return ::send(fd,data,length,int(flags&7)|MSG_NOSIGNAL);});
-    ret(sent<0?net::failErrno():uint32_t(sent),4);
+    const int error=errno;
+    if(auto* current=net::find(arg(0)))net::traceStream(arg(0),*current,true,data,length,sent,error,flags);
+    errno=error;ret(sent<0?net::failErrno():uint32_t(sent),4);
 }
 void socketSendTo(){
     auto* socket=net::find(arg(0));if(!socket){ret(net::fail(net::wsaEnotsock),6);return;}
@@ -303,7 +325,9 @@ void socketRecv(){
     }
     void* data=length?ptr(buffer,length):nullptr;
     ssize_t received=net::blocking(*socket,POLLIN,socket->recvTimeout,[&](int fd){return ::recv(fd,data,length,int(flags&3));});
-    ret(received<0?net::failErrno():uint32_t(received),4);
+    const int error=errno;
+    if(auto* current=net::find(arg(0)))net::traceStream(arg(0),*current,false,data,length,received,error,flags);
+    errno=error;ret(received<0?net::failErrno():uint32_t(received),4);
 }
 void socketRecvFrom(){
     auto* socket=net::find(arg(0));if(!socket){ret(net::fail(net::wsaEnotsock),6);return;}
@@ -460,6 +484,10 @@ void socketSelect(){
         write32(sets[set],uint32_t(hits[set].size()));
         for(size_t i=0;i<hits[set].size();++i)write32(sets[set]+4+uint32_t(i)*4,hits[set][i]);
         total+=uint32_t(hits[set].size());
+    }
+    if(net::traceEnabled()){
+        static unsigned shown=0;
+        if(total&&shown++<128)NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","NET TRACE select read=%zu write=%zu except=%zu",hits[0].size(),hits[1].size(),hits[2].size());
     }
     ret(total,5);
 }
