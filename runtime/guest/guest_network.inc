@@ -5,6 +5,7 @@
 //
 // gethostbyname also carries the community-server redirect (what the PC
 // "eanationhub.asi" mod does): any *.ea.com name resolves onlineServer instead.
+#include "socket_address.h"
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 #include <net/if.h>
@@ -83,15 +84,15 @@ uint32_t fail(uint32_t error){lastError=error;return socketError;}
 uint32_t failErrno(){return fail(wsaError(errno));}
 socklen_t guestAddress(uint32_t address,uint32_t length,sockaddr_storage& out){
     if(!address||int32_t(length)<16||length>sizeof out)return 0;
-    std::memset(&out,0,sizeof out);std::memcpy(&out,ptr(address,length),length);  // SOCKADDR_IN matches sockaddr_in
-    return socklen_t(length);
+    return fo2net::decodeAddress(ptr(address,16),length,out);
 }
 bool storeAddress(uint32_t address,uint32_t lengthPointer,const sockaddr_storage& value,socklen_t length){
     if(!address)return true;
     if(!lengthPointer)return false;
     uint32_t capacity=read32(lengthPointer);
-    if(int32_t(capacity)<int32_t(length))return false;
-    std::memcpy(ptr(address,length),&value,length);write32(lengthPointer,length);return true;
+    if(capacity<16||int32_t(capacity)<0||length<sizeof(sockaddr_in))return false;
+    if(!fo2net::encodeAddress(ptr(address,16),capacity,reinterpret_cast<const sockaddr*>(&value),length))return false;
+    write32(lengthPointer,16);return true;
 }
 uint32_t newHandle(int fd,bool nonBlocking){
     uint32_t handle=nextHandle;nextHandle+=4;
@@ -250,7 +251,11 @@ void socketConnect(){
     auto* in=reinterpret_cast<sockaddr_in*>(&address);char text[INET_ADDRSTRLEN]{};inet_ntop(AF_INET,&in->sin_addr,text,sizeof text);
     NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Winsock: connect %08x to %s:%u",handle,text,ntohs(in->sin_port));
     if(::connect(socket->fd,reinterpret_cast<sockaddr*>(&address),length)==0){ret(0,3);return;}
-    if(errno!=EINPROGRESS){ret(net::failErrno(),3);return;}
+    if(errno!=EINPROGRESS){
+        const int error=errno;
+        NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU2","Winsock: connect %08x failed: errno=%d (%s), WSA=%u",handle,error,std::strerror(error),net::wsaError(error));
+        ret(net::fail(net::wsaError(error)),3);return;
+    }
     if(socket->guestNonBlocking){socket->connecting=true;ret(net::fail(net::wsaEwouldblock),3);return;}
     int fd=socket->fd;net::wait(fd,POLLOUT,0);
     int error=0;socklen_t size=sizeof error;
@@ -518,7 +523,7 @@ void wsaIoctl(){
         local.sin_port=0;
         if(returned)write32(returned,16);
         if(!output||capacity<16){ret(net::fail(net::wsaEfault),9);return;}
-        std::memcpy(ptr(output,16),&local,16);
+        if(!fo2net::encodeAddress(ptr(output,16),capacity,reinterpret_cast<const sockaddr*>(&local),localLength)){ret(net::fail(net::wsaEfault),9);return;}
         char text[INET_ADDRSTRLEN]{},to[INET_ADDRSTRLEN]{};inet_ntop(AF_INET,&local.sin_addr,text,sizeof text);
         inet_ntop(AF_INET,&reinterpret_cast<sockaddr_in*>(&target)->sin_addr,to,sizeof to);
         NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Winsock: route toward %s uses local %s",to,text);
@@ -532,7 +537,7 @@ void wsaIoctl(){
             std::array<uint8_t,76> row{};
             uint32_t flags=1|(entry->ifa_flags&IFF_BROADCAST?2:0)|(entry->ifa_flags&IFF_LOOPBACK?4:0)|(entry->ifa_flags&IFF_POINTOPOINT?8:0)|(entry->ifa_flags&IFF_MULTICAST?16:0);
             std::memcpy(row.data(),&flags,4);
-            auto put=[&](size_t offset,const sockaddr* address){if(address&&address->sa_family==AF_INET)std::memcpy(row.data()+offset,address,16);};
+            auto put=[&](size_t offset,const sockaddr* address){if(address&&address->sa_family==AF_INET)fo2net::encodeAddress(row.data()+offset,24,address,sizeof(sockaddr_in));};
             put(4,entry->ifa_addr);put(28,(entry->ifa_flags&IFF_BROADCAST)?entry->ifa_broadaddr:nullptr);put(52,entry->ifa_netmask);
             rows.push_back(row);
         }
@@ -581,3 +586,23 @@ const std::map<std::string,recomp_func_t> networkFunctions={
     {"socket",socketCreate},{"gethostbyname",hostByName},{"gethostname",hostName},{"WSAGetLastError",wsaGetLastError},
     {"WSASetLastError",wsaSetLastError},{"WSAStartup",wsaStartup},{"WSACleanup",wsaCleanup},
 };
+
+// Exercise the guest-memory adapter without creating any host socket.
+void testGuestSocketAddresses(){
+    const uint32_t data=allocate(64),input=data+4,output=data+28,length=data+56;
+    std::memset(ptr(data,64),0xa5,64);
+    const uint8_t address[16]={2,0,0x70,0xee,192,0,2,7};
+    std::memcpy(ptr(input,16),address,16);write32(length,16);
+    sockaddr_storage native{};
+    if(net::guestAddress(input,16,native)!=sizeof(sockaddr_in)||native.ss_family!=AF_INET||
+       ntohs(reinterpret_cast<sockaddr_in*>(&native)->sin_port)!=28910)
+        throw GuestStop("Guest socket address decode failed");
+    if(!net::storeAddress(output,length,native,sizeof(sockaddr_in))||read32(length)!=16||
+       std::memcmp(ptr(output,16),address,16)||read32(data+24)!=0xa5a5a5a5||read32(data+44)!=0xa5a5a5a5)
+        throw GuestStop("Guest socket address encode/guard failed");
+    std::memset(ptr(output,16),0xa5,16);write32(length,15);
+    if(net::storeAddress(output,length,native,sizeof(sockaddr_in))||read32(length)!=15||read32(output)!=0xa5a5a5a5||
+       net::guestAddress(input,15,native))throw GuestStop("Guest socket address short-buffer check failed");
+    heaps->free(GuestHeaps::process,data);
+    NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Guest Winsock address ABI passed: IPv4, port, roundtrip, output length and guards");
+}

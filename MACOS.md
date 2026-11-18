@@ -58,3 +58,9 @@ A subsequent desktop launch passed effect compilation, texture creation and Core
 `python3 tests/check_video_decode.py /path/to/video.avi` feeds up to 120 real AVI packets through the production guest-player decoder, checking changing nonblack BGR frames, output guards, frame queue and stack cleanup. Both `bg_main.avi` and `introinl.avi` from the user's game archive pass. Test samples remain under ignored `work/`.
 
 The loader initializes the EXE's static PE TLS template and module index, with a separate block through TEB offset `0x2c` for each game/timer thread. This storage is distinct from dynamic Win32 TLS slots. Runtime checks exercise the original networking accessor at `0x005E9350` against two independent TEBs, the site that previously dereferenced guest address zero while searching internet games. Live server discovery and joining still require an interactive network test.
+
+## Socket address checks
+
+Winsock IPv4 addresses use a little-endian 16-bit family at offset zero; Darwin instead stores an 8-bit length and an 8-bit family. The socket adapter explicitly converts both directions for bind/connect/send, peer/local addresses, receives and WSAIoctl route/interface results. Port and IPv4 bytes retain network byte order. `--check-runtime` verifies the actual guest-memory conversion, output length and guards without opening sockets.
+
+Run `python3 scripts/check_network_macos.py --offline` for address ABI tests, omit `--offline` for TCP/UDP loopback, or use `--openspy` to also resolve and connect to `flatout2pc.ms8.openspy.net:28910`. `CheckNetwork.command` runs the last option from Terminal. Logs are `work/macos/network-offline.log`, `network-loopback.log` and `network-openspy.log`. The OpenSpy probe checks DNS and a TCP handshake only; obtaining a server list and joining a game still need an in-game test. Run the script in a normal user Terminal if the agent environment denies socket access.
