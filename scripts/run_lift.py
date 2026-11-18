@@ -125,6 +125,63 @@ def rebuild(md, img, base, fd, bounded=False):
     return f
 
 
+def rebuild_partitioned(md, img, base, fd, lifted):
+    """Keep reachable blocks until another dispatchable entry, including cold tails.
+
+    Catalog ``end`` is only a size estimate: branches can reach blocks beyond
+    it which have no dispatch entry of their own. Walk those edges rather than
+    turning every out-of-range branch into an unresolved indirect tail call.
+    """
+    from bisect import bisect_right
+    from types import SimpleNamespace
+    from capstone.x86 import X86_OP_IMM
+    ranges = {b[0]: b for b in fd["blocks"]}
+    starts = sorted(ranges)
+    entries = sorted(lifted)
+    f = Function(address=fd["address"], end=fd["end"], size=fd["size"],
+                 name=f"sub_{fd['address']:08X}", is_thunk=fd["is_thunk"],
+                 entry_kind=fd["entry_kind"])
+    f.jump_targets = set(fd["jump_targets"])
+    f.calls_to = set(fd["calls_to"])
+    pending = [fd["address"]]
+    while pending:
+        start = pending.pop()
+        if start in f.blocks or (start != f.address and start in lifted):
+            continue
+        i = bisect_right(starts, start) - 1
+        if i < 0 or not (starts[i] <= start < ranges[starts[i]][1]):
+            # External targets (e.g. import thunks) remain runtime dispatches.
+            continue
+        _, end, successors, ex = ranges[starts[i]]
+        j = bisect_right(entries, start)
+        if j < len(entries):
+            end = min(end, entries[j])
+        b = BasicBlock(start=start, end=end, successors=[], is_exit=bool(ex))
+        for ins in md.disasm(img[start-base:end-base], start):
+            mnemonic = "ret" if ins.mnemonic in ("repz ret", "rep ret") else ins.mnemonic
+            instruction = Instruction(ins.address, ins.size, mnemonic, ins.op_str,
+                                      bytes(ins.bytes), list(ins.operands))
+            b.instructions.append(instruction)
+            if instruction.is_terminator:
+                break
+        if not b.instructions:
+            continue
+        last = b.instructions[-1]
+        b.end = last.end_address
+        if last.is_jump:
+            target = last.get_branch_target()
+            b.successors.extend([target] if target is not None else successors)
+        if not (last.is_ret or last.is_uncond_jump):
+            fallthrough = last.end_address
+            b.successors.append(fallthrough)
+            # Explicit fallthrough also handles gaps in address-sorted output.
+            b.instructions.append(Instruction(fallthrough, 0, "jmp", f"0x{fallthrough:x}",
+                b"", [SimpleNamespace(type=X86_OP_IMM, imm=fallthrough)]))
+        f.blocks[start] = b
+        pending.extend(b.successors)
+    return f
+
+
 def va_list(name):
     """config/<name>: "VA  comment" lines -> {va: comment} (missing file: empty)."""
     out = {}
@@ -222,7 +279,8 @@ def cmd_lift(exe, catalog, outdir, split=400, names_path=None, prefix="", bounde
                         f"void sub_{a:08X}(void) {{ RECOMP_UNIMPL(0x{a:08X}u, \"excluded: not code\"); }}")
                 stats["excluded"] += 1
             else:
-                f = rebuild(md, img, base, fd, bounded=bounded)
+                f = (rebuild_partitioned(md, img, base, fd, lifted) if bounded
+                     else rebuild(md, img, base, fd))
                 code = lifter.lift_function(f)
                 for old, new in call_rewrites:
                     if old in code:

@@ -46,13 +46,22 @@ if(g_eax!=(i==0?14u:7u)||g_esp!=516)return 1;}return 0;}
             for boundary in [5,21]:
                 entries[0]["end"]=start+boundary
                 entries[0]["size"]=boundary
-                for bounded in [False,True]:
+                for bounded in [False,True,"partitioned","missing-entry"]:
                     md=Cs(CS_ARCH_X86,CS_MODE_32);md.detail=True
-                    lifter=Lifter(lifted={f['address'] for f in entries},hook_sites=set(),precise_carry=True)
-                    code='\n'.join(lifter.lift_function(run_lift.rebuild(md,image,base,fd,bounded=bounded)) for fd in entries)
+                    active=[f for f in entries if bounded != 'missing-entry' or f['address'] != start+16]
+                    lifted={f['address'] for f in active}
+                    lifter=Lifter(lifted=lifted,hook_sites=set(),precise_carry=True)
+                    def rebuild(fd):
+                        if isinstance(bounded,str):
+                            return run_lift.rebuild_partitioned(md,image,base,fd,lifted)
+                        return run_lift.rebuild(md,image,base,fd,bounded=bounded)
+                    code='\n'.join(lifter.lift_function(rebuild(fd)) for fd in active)
+                    active_harness=case_harness
+                    if bounded == 'missing-entry':
+                        active_harness=active_harness.replace('case 0x401010:return sub_00401010;','')
                     with tempfile.TemporaryDirectory() as tmp:
                         source=Path(tmp)/'check.c';binary=Path(tmp)/'check'
-                        source.write_text('#define RECOMP_GENERATED_CODE\n#include "recomp_types.h"\n'+declarations+'\n'+code+'\n'+case_harness)
+                        source.write_text('#define RECOMP_GENERATED_CODE\n#include "recomp_types.h"\n'+declarations+'\n'+code+'\n'+active_harness)
                         subprocess.run(['clang','-O2','-DRECOMP_LOCAL_REGS','-I'+str(ROOT/'work/macos/include'),str(source),'-o',str(binary)],check=True,capture_output=True)
                         subprocess.run([str(binary)],check=True)
 if __name__=='__main__':unittest.main()

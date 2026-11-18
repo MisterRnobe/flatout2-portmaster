@@ -32,7 +32,7 @@ The macOS build reserves the guest address space at 1 TB through Mach VM, outsid
 
 ## Validation
 
-`work/venv/bin/python tests/test_catalog_memory.py` compares compact and full-operand discovery for branches, jump tables and callbacks. `work/venv/bin/python tests/test_lift_boundaries.py` executes generated C to verify conditional tail transfers, fallthroughs and guest stack cleanup across catalog boundaries. D3DX lifting uses `--bounded` to avoid copying blocks beyond a function’s catalog extent; the PC EXE retains the upstream lift. D3DX uses the global x87 stack; the game code keeps the analyzed local-window optimization. The compact cache applies only to catalog discovery; lifting retains complete operands.
+`work/venv/bin/python tests/test_catalog_memory.py` compares compact and full-operand discovery for branches, jump tables and callbacks. `work/venv/bin/python tests/test_lift_boundaries.py` executes generated C to verify conditional tail transfers, fallthroughs and guest stack cleanup across catalog boundaries. D3DX lifting uses `--bounded` to partition reachable blocks at registered function entries. Cold blocks beyond the catalog size estimate stay in their caller when they have no dispatch entry; explicit fallthroughs preserve control flow across gaps. The PC EXE retains the upstream lift. D3DX uses the global x87 stack; the game code keeps the analyzed local-window optimization. The compact cache applies only to catalog discovery; lifting retains complete operands.
 
 ```sh
 ./work/macos/fo2 "$PWD/gamedata" --check-runtime
@@ -42,4 +42,4 @@ This does not open a window or start the game. It checks the 4 GB guest address 
 
 Linux-only `/proc` signal sampling and the hang watchdog are disabled on macOS; normal frame timing/FPS reporting remains available. LAN uses macOS socket wrappers and adapter enumeration; interoperability needs a separate multiplayer test.
 
-The macOS runtime check passed on the compatible Steam/Zoom executable, including D3DX DllMain and its import bindings. ARM64 Mach-O signing verification and an ANGLE software-OpenGL pbuffer pixel readback also passed. Interactive launch was blocked by this build environment’s LaunchServices/display access, so Metal rendering and a full race still need desktop validation.
+The macOS runtime check passed on the compatible Steam/Zoom executable, including D3DX DllMain and its import bindings. ARM64 Mach-O signing verification and an ANGLE software-OpenGL pbuffer pixel readback also passed. A desktop launch also created the D3D9 device through ANGLE Metal on an Apple M3 Pro. It then exposed an unresolved D3DX cold-block transfer at `0x00AE121F`; the bounded lift now preserves that block, with executable regression coverage for missing dispatch entries. Menu rendering and a full race still need desktop validation.
