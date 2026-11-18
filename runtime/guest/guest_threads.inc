@@ -115,7 +115,7 @@ void* guestThreadEntry(void* context){
         thread.exitCode=1;
         if(!stopRequested){guestThreadFault=error.what();NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU2","Guest thread %u: %s",thread.id,error.what());}
     }catch(const std::exception& error){thread.exitCode=1;guestThreadFault=error.what();}
-    heaps->free(GuestHeaps::process,thread.stack);heaps->free(GuestHeaps::process,thread.tib);
+    releaseStaticTLS(thread.tib);heaps->free(GuestHeaps::process,thread.stack);heaps->free(GuestHeaps::process,thread.tib);
     {std::lock_guard<std::mutex> l(guestMutexState);
      for(auto& value:mutexHandles)if(value.second->owner==thread.id){__atomic_store_n(&value.second->owner,0u,__ATOMIC_RELEASE);value.second->depth=0;value.second->abandoned=true;}}
     forgetThreadTrace();thread.done=true;notifyGuestSync();machineLease=nullptr;return nullptr;
@@ -137,9 +137,10 @@ void createThread(){
     thread->stack=allocate(4u<<20);thread->tib=allocate(4096);
     write32(thread->tib,UINT32_MAX);write32(thread->tib+4,thread->stack+(4u<<20));write32(thread->tib+8,thread->stack);
     write32(thread->tib+0x18,thread->tib);write32(thread->tib+0x20,1);write32(thread->tib+0x24,thread->id);
+    initializeStaticTLS(thread->tib);
     pthread_attr_t attributes;int error=pthread_attr_init(&attributes);
     if(!error){error=pthread_attr_setstacksize(&attributes,64u<<20);if(!error)error=pthread_create(&thread->native,&attributes,guestThreadEntry,thread.get());pthread_attr_destroy(&attributes);}
-    if(error){heaps->free(GuestHeaps::process,thread->stack);heaps->free(GuestHeaps::process,thread->tib);lastError=8;ret(0,6);return;}
+    if(error){releaseStaticTLS(thread->tib);heaps->free(GuestHeaps::process,thread->stack);heaps->free(GuestHeaps::process,thread->tib);lastError=8;ret(0,6);return;}
     thread->started=true;guestThreads.push_back(thread);threadHandles.emplace(thread->handle,thread);
     if(idOut)write32(idOut,thread->id);
     NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Created guest thread %u at %08x suspended=%u",thread->id,thread->start,thread->suspended);
@@ -257,9 +258,10 @@ void timeSetEvent(){
     thread->stack=allocate(4u<<20);thread->tib=allocate(4096);
     write32(thread->tib,UINT32_MAX);write32(thread->tib+4,thread->stack+(4u<<20));write32(thread->tib+8,thread->stack);
     write32(thread->tib+0x18,thread->tib);write32(thread->tib+0x20,1);write32(thread->tib+0x24,thread->id);
+    initializeStaticTLS(thread->tib);
     pthread_attr_t attributes;int error=pthread_attr_init(&attributes);
     if(!error){error=pthread_attr_setstacksize(&attributes,64u<<20);if(!error)error=pthread_create(&thread->native,&attributes,guestThreadEntry,thread.get());pthread_attr_destroy(&attributes);}
-    if(error){heaps->free(GuestHeaps::process,thread->stack);heaps->free(GuestHeaps::process,thread->tib);timerHandles.erase(id);ret(0,5);return;}
+    if(error){releaseStaticTLS(thread->tib);heaps->free(GuestHeaps::process,thread->stack);heaps->free(GuestHeaps::process,thread->tib);timerHandles.erase(id);ret(0,5);return;}
     thread->started=true;guestThreads.push_back(thread);timerWorker=thread;
     NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Created persistent guest timer worker thread %u",thread->id);ret(id,5);
 }

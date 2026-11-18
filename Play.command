@@ -8,6 +8,7 @@ export SDL_OPENGL_LIBRARY="$PWD/work/macos/lib/libGLESv2.dylib"
 export SDL_VIDEO_GL_DRIVER="$PWD/work/macos/lib/libGLESv2.dylib"
 export NFSU2_SCREEN="${NFSU2_SCREEN:-1280x800}"
 export FO2_RENDER="${FO2_RENDER:-1280x800}"
+export FO2_SKIP_LOGO="${FO2_SKIP_LOGO:-0}"
 export NFSU2_SHOW_FPS="${NFSU2_SHOW_FPS:-1}"
 # Keep the imported display mode consistent with the mode the runtime advertises.
 python3 - <<'PYCFG'

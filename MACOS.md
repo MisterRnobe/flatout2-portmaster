@@ -5,7 +5,7 @@ This branch adds a native ARM64 macOS build of the PC recompilation. The game co
 ## Requirements
 
 - Apple Silicon Mac and Xcode command line tools. The code targets macOS 13+, but installed dependencies must support your OS; this local build was validated on macOS 26.6.2 with SDL2-compat 2.32.74 built for macOS 26.
-- Homebrew `llvm`, `sdl2`, `python` (and optionally `ffmpeg` for native VP3 menu videos).
+- Homebrew `llvm`, `sdl2`, `python`, plus Git and Make. The local video decoder is built from pinned FFmpeg source and does not depend on Homebrew FFmpeg.
 - Python packages `capstone==5.0.7` and `pefile==2024.8.26`.
 - ARM64 ANGLE `libEGL.dylib` and `libGLESv2.dylib`. Setup can copy these from an installed Visual Studio Code or Claude; alternatively pass `--angle-dir /path/to/angle`. These libraries are local build dependencies and are not committed.
 - Your game installation, with `FlatOut2.exe` MD5 `1f8cae2b47276ca134750ba438aa35ca`, `d3dx9_30.dll`, `filesystem`, and the BFS archives it lists. Some current Steam installations have this compatible Zoom executable; the checksum is what matters.
@@ -13,10 +13,11 @@ This branch adds a native ARM64 macOS build of the PC recompilation. The game co
 ## Build
 
 ```sh
-brew install llvm sdl2 python ffmpeg
+brew install llvm sdl2 python
 python3 -m venv work/venv
 work/venv/bin/pip install capstone==5.0.7 pefile==2024.8.26
 work/venv/bin/python scripts/setup_macos.py --game-dir "/path/to/FlatOut 2"
+work/venv/bin/python scripts/build_video_macos.py
 work/venv/bin/python scripts/lift_macos.py
 work/venv/bin/python scripts/build_macos.py
 ./Play.command
@@ -49,3 +50,11 @@ For a native crash, macOS prints a minimal `[FO2 FAULT]` record before the detai
 `python3 tests/test_native_tail.py` checks a million transfers with constant native stack usage. `python3 tests/test_d3dx_tail_loop.py` extracts the six generated D3DX functions from the reported `0x00AD70F2`–`0x00AD7187` loop: the old transfer reproduces a stack-overflow signal on the long workload, while the guaranteed tail transfer completes 1,048,576 vector accumulations with checked numeric results and guest stack cleanup. These checks need local generated code, but no desktop or GPU.
 
 A subsequent desktop launch passed effect compilation, texture creation and CoreAudio initialization, then exhausted its 64 MB native stack in the split D3DX vector loop. Guaranteed native tail transfers fix the reproduced overflow; the exact-loop replay and headless shader compiler checks pass. Interactive menu and race validation remain outstanding.
+
+## Videos and networking TLS
+
+`scripts/build_video_macos.py` builds FFmpeg n8.0.1 (`894da5ca7d742e4429ffb2af534fcda0103ef593`) with only the VP3 decoder enabled, copies the two LGPL libraries into `work/macos/lib`, fixes their loader paths and signs them. The runtime prefers this local pair over system FFmpeg; this avoids unrelated broken Homebrew codec dependencies. The launcher defaults `FO2_SKIP_LOGO=0` so the opening logo plays too. Set it to `1` to skip that logo.
+
+`python3 tests/check_video_decode.py /path/to/video.avi` feeds up to 120 real AVI packets through the production guest-player decoder, checking changing nonblack BGR frames, output guards, frame queue and stack cleanup. Both `bg_main.avi` and `introinl.avi` from the user's game archive pass. Test samples remain under ignored `work/`.
+
+The loader initializes the EXE's static PE TLS template and module index, with a separate block through TEB offset `0x2c` for each game/timer thread. This storage is distinct from dynamic Win32 TLS slots. Runtime checks exercise the original networking accessor at `0x005E9350` against two independent TEBs, the site that previously dereferenced guest address zero while searching internet games. Live server discovery and joining still require an interactive network test.

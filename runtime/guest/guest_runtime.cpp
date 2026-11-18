@@ -440,6 +440,22 @@ uint32_t allocate(uint32_t bytes) {
     if(!result) throw GuestStop("Guest allocator exhausted");
     return result;
 }
+// PE static TLS is separate from the Win32 TlsAlloc/TlsGetValue slots.
+// FlatOut's networking library reads its module block through FS:[0x2c].
+std::vector<unsigned char> peTlsTemplate;
+uint32_t peTlsBytes=0;
+void initializeStaticTLS(uint32_t threadTib){
+    if(!peTlsBytes)return;
+    uint32_t block=allocate(16+peTlsBytes);
+    write32(block,block+16);
+    std::memcpy(ptr(block+16,peTlsTemplate.size()),peTlsTemplate.data(),peTlsTemplate.size());
+    write32(threadTib+0x2c,block);
+}
+void releaseStaticTLS(uint32_t threadTib){
+    if(uint32_t block=read32(threadTib+0x2c)){
+        heaps->free(GuestHeaps::process,block);write32(threadTib+0x2c,0);
+    }
+}
 void unsupported() {
     uint32_t index = (lastImport-importBase)/16;
     throw GuestStop("HLE pendiente: " + imports.at(index).name + " desde " + hex(g_cur_func));
@@ -749,6 +765,20 @@ void loadImage(const char* path) {
         imageRange(sec.VirtualAddress,std::max(sec.VirtualSize,sec.SizeOfRawData));
         if (uint64_t(sec.PointerToRawData)+sec.SizeOfRawData>file.size()) throw GuestStop("Truncated PE section");
         std::memcpy(ptr(imageBase+sec.VirtualAddress,sec.SizeOfRawData),file.data()+sec.PointerToRawData,sec.SizeOfRawData);
+    }
+    if(auto tls=opt.DataDirectory[9];tls.Size){
+        imageRange(tls.VirtualAddress,24);
+        const uint32_t directory=imageBase+tls.VirtualAddress;
+        uint32_t start=read32(directory),end=read32(directory+4),index=read32(directory+8);
+        uint32_t callbacks=read32(directory+12),zero=read32(directory+16);
+        if(end<start||uint64_t(end-start)+zero>65536)throw GuestStop("Invalid PE TLS template");
+        imageRange(start-imageBase,end-start);imageRange(index-imageBase,4);
+        if(callbacks){imageRange(callbacks-imageBase,4);if(read32(callbacks))throw GuestStop("PE TLS callbacks unsupported");}
+        peTlsTemplate.resize(end-start);
+        std::memcpy(peTlsTemplate.data(),ptr(start,end-start),end-start);
+        peTlsBytes=std::max(1u,end-start+zero);
+        write32(index,0); // this executable is the only module with static TLS
+        NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","PE static TLS: %u initialized, %u zero-fill bytes, module index 0",end-start,zero);
     }
     entry=imageBase+opt.AddressOfEntryPoint;
     // Guest VAs stay fixed; the 64-bit host base is ADDR's offset. No PE
@@ -1243,7 +1273,29 @@ std::string connectGuestRuntime(const char* executable, bool checkOnly) {
         memory->commit(stackBase,stackSize); memory->commit(tib,0x1000);
         State fresh; fresh.esp=stackBase+stackSize-64; fresh.fs=tib; fresh.load();
         write32(tib,0xffffffff); write32(tib+4,stackBase+stackSize); write32(tib+8,stackBase); write32(tib+0x18,tib);
+        initializeStaticTLS(tib);
         // testLiftedCopy() calls SPEED2.EXE's memcpy at 0x401000; that address is other code in AlienShooter.exe.
+        if(peTlsBytes){
+            uint32_t other=allocate(4096);initializeStaticTLS(other);
+            uint32_t first=read32(read32(tib+0x2c)),second=read32(read32(other+0x2c));
+            if(!first||!second||first==second||std::memcmp(ptr(first,peTlsTemplate.size()),peTlsTemplate.data(),peTlsTemplate.size())||
+               std::memcmp(ptr(second,peTlsTemplate.size()),peTlsTemplate.data(),peTlsTemplate.size()))throw GuestStop("PE static TLS template/isolation failed");
+            *static_cast<unsigned char*>(ptr(second,1))=0xa5;
+            if(*static_cast<unsigned char*>(ptr(first,1))!=(peTlsTemplate.empty()?0:peTlsTemplate[0]))throw GuestStop("PE static TLS blocks alias");
+            // Replay the exact networking accessor from the crash, using cached
+            // per-thread values so it does not require a live server or CRT malloc.
+            if(peTlsBytes>=8){
+                uint32_t a=allocate(4),b=allocate(4),savedFs=g_fs_base;
+                write32(first+4,a);write32(second+4,b);
+                if(callGuest(0x005E9350u,{})!=a)throw GuestStop("Main network static TLS accessor failed");
+                g_fs_base=other;
+                if(callGuest(0x005E9350u,{})!=b)throw GuestStop("Worker network static TLS accessor failed");
+                g_fs_base=savedFs;write32(first+4,0);
+                heaps->free(GuestHeaps::process,a);heaps->free(GuestHeaps::process,b);
+            }
+            releaseStaticTLS(other);heaps->free(GuestHeaps::process,other);
+            NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","PE static TLS template, per-thread isolation and lifted network accessor passed");
+        }
         testGuestScheduling();
         testGuestInput();
         testGuestSoundCaps();
