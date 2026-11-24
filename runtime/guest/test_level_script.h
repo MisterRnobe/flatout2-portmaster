@@ -18,8 +18,8 @@ public:
       return {};
     }
     if(!buffer_||buffer_!=buffer)return {};
-    const std::string id=derby_?"57":"16";
-    const std::string path=derby_?"data/Tracks/Derby/Derby6/A/":"data/Tracks/Canal/Canal1/A/";
+    const std::string id=derby_?"56":"16";
+    const std::string path=derby_?"data/Tracks/Derby/Derby5/A/":"data/Tracks/Canal/Canal1/A/";
     const std::string text=
       "\nif menu_singleplayer and menu_singleplayer.update then\n"
       "local previous=menu_singleplayer.update\n"

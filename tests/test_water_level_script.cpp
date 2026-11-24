@@ -23,7 +23,7 @@ int main(){
   assert(disabled.read(6,menuHeader).empty()&&disabled.read(6,"").empty());
   fo2test::AutoRaceMenuScript derby(true,true);derby.read(8,menuHeader);std::string derbyPayload;
   for(;;){auto chunk=derby.read(8,"");if(chunk.empty())break;assert(chunk.size()<=512);derbyPayload+=chunk;}
-  assert(derbyPayload.find("Levels[57].StagePath==\"data/Tracks/Derby/Derby6/A/\"")!=std::string::npos);
-  assert(derbyPayload.find("PreRace.Level=57")!=std::string::npos&&derbyPayload.find("GM_SINGLE_RACE")!=std::string::npos);
+  assert(derbyPayload.find("Levels[56].StagePath==\"data/Tracks/Derby/Derby5/A/\"")!=std::string::npos);
+  assert(derbyPayload.find("PreRace.Level=56")!=std::string::npos&&derbyPayload.find("GM_SINGLE_RACE")!=std::string::npos);
   std::puts("Water-level script checks passed: exact header, EOF/buffer matching, bounded one-time injection, type preservation and disabled mode");
 }

@@ -19,7 +19,7 @@ if (( auto_race )); then
     export FO2_GAME_DIR="$(python3 scripts/prepare_test_scenario.py --source "$PWD/gamedata" --session "$FO2_METAL_SESSION_DIR" --seed "$PWD/work/metal/scenarios/rt-auto-race/seed")"
     export FO2_TEST_SCENARIO=auto-race FO2_TEST_LEVEL=water-derby
     export FO2_SCENARIO_STATUS="$FO2_METAL_SESSION_DIR/scenario-status.json"
-    echo "Automatic Derby Bowl 3 (level 57). Isolated saves: $FO2_GAME_DIR/Savegame"
+    echo "Automatic Derby Bowl 2 (level 56). Isolated saves: $FO2_GAME_DIR/Savegame"
 else
     echo "Manual selection. Saves: $FO2_GAME_DIR/Savegame"
 fi
