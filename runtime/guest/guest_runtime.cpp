@@ -1744,11 +1744,11 @@ static bool fo2PauseMenuOpen(){
     if(!on||!memory)return false;
     return read32(0x008DBE34u)==1u||read32(0x008DA4ECu)==1u;
 }
-bool fo2InRace(){
+bool fo2RaceStepping(){
     const int64_t last=lastRacePhysics.load(std::memory_order_relaxed);
-    const bool stepping=last&&std::chrono::steady_clock::now().time_since_epoch().count()-last<int64_t(std::chrono::nanoseconds(std::chrono::milliseconds(300)).count());
-    return stepping&&!fo2PauseMenuOpen();
+    return last&&std::chrono::steady_clock::now().time_since_epoch().count()-last<int64_t(std::chrono::nanoseconds(std::chrono::milliseconds(300)).count());
 }
+bool fo2InRace(){return fo2RaceStepping()&&!fo2PauseMenuOpen();}
 void setGuestPad(const float axes[6],uint32_t buttons,int hatX,int hatY){
     std::lock_guard<std::mutex> lock(inputMutex);
     for(unsigned i=0;i<6;++i)inputPad.axis[i]=std::max(-1.f,std::min(1.f,axes[i]));

@@ -17,12 +17,12 @@ class RaceScenario {
   bool cancel_ = false;
 public:
   explicit RaceScenario(bool enabled,bool directRace=false) : enabled_(enabled),directRace_(directRace) {}
-  unsigned steps()const{return directRace_?4:8;}
+  unsigned steps()const{return directRace_?5:8;}
   bool enabled() const { return enabled_; }
   ScenarioState state() const { return state_; }
   unsigned step() const { return step_; }
   void cancel() { cancel_ = true; }
-  ScenarioUpdate tick(double seconds, uint32_t frame, bool racing, bool viewReady=true) {
+  ScenarioUpdate tick(double seconds, uint32_t frame, bool racing, bool viewReady=true,bool raceLoaded=false) {
     ScenarioUpdate out;
     if (!enabled_ || state_ == ScenarioState::Ready || state_ == ScenarioState::Failed ||
         state_ == ScenarioState::Cancelled) return out;
@@ -51,6 +51,10 @@ public:
     if (frame && firstFrame_ < 0) firstFrame_ = seconds;
     if (firstFrame_ < 0 || frame < 60 || seconds - firstFrame_ < 1) return out;
     if (step_ >= steps()) { state_ = ScenarioState::AwaitingRace;return out; }
+    // The direct Lua path loads a race but leaves its Start Derby prompt.
+    // Confirm once only after actual race physics, never while still loading
+    // or in the Single Player frontend. Readiness still requires active play.
+    if (directRace_ && step_ >= 4 && !raceLoaded) { state_ = ScenarioState::AwaitingRace;return out; }
     if (seconds < next_ || (step_ && uint32_t(frame - lastFrame_) < 5)) return out;
     held_ = step_ == 6 ? 1 : 0;
     ++step_;pressed_ = seconds;next_ = seconds + 4;lastFrame_ = frame;

@@ -12,6 +12,7 @@ void setGuestKey(unsigned scan,bool down);
 void clearGuestInput();
 bool guestDrivingControls();
 bool fo2InRace();   // FlatOut 2's physics stepped in the last 300 ms (config/hooks.txt 0x56C850)
+bool fo2RaceStepping(); // Includes the loaded race's start/pause overlay.
 // Physical gamepad seen by the game as a DirectInput joystick: axes X, Y, Z
 // (triggers), Rx, Ry, Rz in -1..1; buttons A B X Y LB RB Back Start LS RS as bits.
 void setGuestPad(const float axes[6],uint32_t buttons,int hatX,int hatY);

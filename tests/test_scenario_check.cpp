@@ -36,12 +36,15 @@ int main() {
   debug.tick(0,1,true,false);
   assert(!debug.tick(1,100,true,false).ready);
   assert(debug.tick(1.1,101,true,true).ready);
-  RaceScenario direct(true,true);assert(direct.steps()==4);
+  RaceScenario direct(true,true);assert(direct.steps()==5);
   direct.tick(0,0,false);direct.tick(1,60,false);
   for(unsigned i=0;i<4;++i){double t=2+i*4;assert(direct.tick(t,120+i*120,false).press==0);assert(direct.tick(t+.3,130+i*120,false).release==0);}
   // Once Single Player is open, send no fifth confirm into its Career item.
   assert(direct.tick(20,1500,false).press==-1&&direct.step()==4);
-  assert(!direct.tick(21,1600,true,false).ready);
-  assert(direct.tick(22,1604,true,true).ready);
+  assert(direct.tick(21,1600,false,false,true).press==0&&direct.step()==5);
+  assert(direct.tick(21.3,1618,false,false,true).release==0);
+  assert(direct.tick(25,1840,false,false,true).press==-1);
+  assert(!direct.tick(26,1900,true,false,true).ready);
+  assert(direct.tick(27,1960,true,true,true).ready);
   std::puts("Scenario checks passed: finite route, physics-confirmed readiness, frame stalls, timeout, cancellation and input release");
 }

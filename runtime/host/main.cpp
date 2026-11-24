@@ -707,7 +707,7 @@ int main(int argc, char** argv) {
             viewReady=fo2render::parseDebugView(std::getenv("FO2_DEBUG_VIEW"))==fo2render::DebugView::Off||fo2MetalDebugReady();
             if(testLevel=="water-canal")viewReady=viewReady&&fo2TestLevelInjected()&&fo2MetalWaterReady();
 #endif
-            auto update=autoScenario.tick(seconds,getD3D9PresentCount(),fo2InRace(),viewReady);
+            auto update=autoScenario.tick(seconds,getD3D9PresentCount(),fo2InRace(),viewReady,fo2RaceStepping());
             auto button=[](int action){return action==1?SDL_CONTROLLER_BUTTON_DPAD_RIGHT:SDL_CONTROLLER_BUTTON_A;};
             if(update.release>=0){g_gamepad.button(button(update.release),false,fo2InRace(),padSetKey);publishGamepad();}
             if(update.press>=0){
@@ -717,7 +717,11 @@ int main(int argc, char** argv) {
             if(update.capture)requestD3D9Screenshot();
             if(update.ready)writeScenario("ready",getD3D9PresentCount(),seconds);
             if(update.cancelled){writeScenario("cancelled",getD3D9PresentCount(),seconds);scenarioExitCode=2;}
-            if(update.failed){writeScenario("failed",getD3D9PresentCount(),seconds);scenarioExitCode=2;g_running=false;break;}
+            if(update.failed){
+                writeScenario("failed",getD3D9PresentCount(),seconds);scenarioExitCode=2;
+                if(testLevel.empty()){g_running=false;break;}
+                std::puts("[FO2 SCENARIO] Automatic startup timed out; input released, game left open for manual control.");
+            }
         }
 
         // NFSU2_KEY_SCRIPT="start;frame:key[:frames],..." (smoke tests): from frame `start` on, the automatic menu
