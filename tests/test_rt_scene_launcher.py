@@ -61,11 +61,11 @@ echo "$1" >> "$FO2_FAKE_LOG"
                 self.assertEqual((root/'gamedata/Savegame/profile').read_text(), 'original')
             return run, (root/'calls').read_text()
 
-    def test_dedicated_race_uses_rt_and_isolated_canal(self):
+    def test_dedicated_race_uses_rt_and_isolated_derby(self):
         run, calls = self.launch(dedicated=True)
         self.assertEqual(run.returncode, 0, run.stdout+run.stderr)
         self.assertIn('play:auto-race:ssr', calls)
-        self.assertIn('level:water-canal', calls)
+        self.assertIn('level:water-derby', calls)
         self.assertIn('water:1', calls)
         self.assertIn('--metal-check-raytracing-water', calls)
 
@@ -73,7 +73,7 @@ echo "$1" >> "$FO2_FAKE_LOG"
         run, calls = self.launch(('--auto-race', '--rt-water', '--mask'), water_result=77)
         self.assertEqual(run.returncode, 0, run.stdout+run.stderr)
         self.assertIn('play:auto-race:ssr-mask', calls)
-        self.assertIn('level:water-canal', calls)
+        self.assertIn('level:water-derby', calls)
         self.assertIn('water:0', calls)
 
     def test_water_mode_preflight_and_fallback(self):

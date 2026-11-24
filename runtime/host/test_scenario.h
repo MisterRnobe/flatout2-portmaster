@@ -8,6 +8,7 @@ struct ScenarioUpdate {
 };
 class RaceScenario {
   bool enabled_;
+  bool directRace_;
   ScenarioState state_ = ScenarioState::Waiting;
   double began_ = -1, firstFrame_ = -1, pressed_ = 0, next_ = 0, race_ = -1;
   uint32_t lastFrame_ = 0, raceFrame_ = 0;
@@ -15,7 +16,8 @@ class RaceScenario {
   unsigned step_ = 0;
   bool cancel_ = false;
 public:
-  explicit RaceScenario(bool enabled) : enabled_(enabled) {}
+  explicit RaceScenario(bool enabled,bool directRace=false) : enabled_(enabled),directRace_(directRace) {}
+  unsigned steps()const{return directRace_?4:8;}
   bool enabled() const { return enabled_; }
   ScenarioState state() const { return state_; }
   unsigned step() const { return step_; }
@@ -48,7 +50,7 @@ public:
     }
     if (frame && firstFrame_ < 0) firstFrame_ = seconds;
     if (firstFrame_ < 0 || frame < 60 || seconds - firstFrame_ < 1) return out;
-    if (step_ >= 8) { state_ = ScenarioState::AwaitingRace;return out; }
+    if (step_ >= steps()) { state_ = ScenarioState::AwaitingRace;return out; }
     if (seconds < next_ || (step_ && uint32_t(frame - lastFrame_) < 5)) return out;
     held_ = step_ == 6 ? 1 : 0;
     ++step_;pressed_ = seconds;next_ = seconds + 4;lastFrame_ = frame;

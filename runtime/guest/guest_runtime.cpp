@@ -1555,6 +1555,7 @@ extern "C" { uint32_t g_recomp_skip_function=0; } // a skippable function return
 // "Cameras=" and has five cameras (the other camera files have another count); at its end this text is read as more of
 // the file. Only the language itself is used: the game does not open every Lua library.
 static fo2test::WaterLevelScript waterLevelScript([]{const char* level=std::getenv("FO2_TEST_LEVEL");return level&&std::string(level)=="water-canal";}());
+static fo2test::AutoRaceMenuScript autoRaceMenuScript([]{const char* level=std::getenv("FO2_TEST_LEVEL");return level&&(std::string(level)=="water-canal"||std::string(level)=="water-derby");}(),[]{const char* level=std::getenv("FO2_TEST_LEVEL");return level&&std::string(level)=="water-derby";}());
 static std::atomic<bool> waterLevelInjectedReady{false};
 bool fo2TestLevelInjected(){return waterLevelInjectedReady.load(std::memory_order_acquire);}
 static void fo2TestLevelRead(){
@@ -1564,6 +1565,9 @@ static void fo2TestLevelRead(){
     waterLevelInjectedReady.store(waterLevelScript.injected(),std::memory_order_release);
     if(!extra.empty()){std::memcpy(ptr(buffer,extra.size()),extra.data(),extra.size());g_eax=extra.size();
       std::printf("[FO2 SCENARIO] Water Canal 1 installed into the isolated first race slot\n");}
+    auto menu=autoRaceMenuScript.read(buffer,std::string_view(g_eax?static_cast<const char*>(ptr(buffer,g_eax)):"",g_eax));
+    if(!menu.empty()){std::memcpy(ptr(buffer,menu.size()),menu.data(),menu.size());g_eax=menu.size();
+      std::puts("[FO2 SCENARIO] Direct single-race startup installed (FO2_TEST_LEVEL); Career selection disabled");}
 }
 static void fo2CameraScriptRead(){
     static const bool on=[]{const char* e=std::getenv("FO2_CAM4");return !e||e[0]!='0';}();

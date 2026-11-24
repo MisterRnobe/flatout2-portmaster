@@ -479,7 +479,7 @@ int main(int argc, char** argv) {
     catch(const std::exception& e){std::fprintf(stderr,"%s\n",e.what());return 2;}
 #endif
     const std::string testLevel=std::getenv("FO2_TEST_LEVEL")?std::getenv("FO2_TEST_LEVEL"):"";
-    if(!testLevel.empty()&&(testLevel!="water-canal"||scenarioName!="auto-race")){
+    if(!testLevel.empty()&&((testLevel!="water-canal"&&testLevel!="water-derby")||scenarioName!="auto-race")){
         std::fprintf(stderr,"Water test level requires the isolated auto-race scenario\n");return 2;
     }
     if(!testLevel.empty()){
@@ -497,7 +497,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr,"Water test level may only run with a per-session copy of gamedata\n");return 2;
         }
     }
-    fo2test::RaceScenario autoScenario(scenarioName=="auto-race");
+    fo2test::RaceScenario autoScenario(scenarioName=="auto-race",!testLevel.empty());
     if(autoScenario.enabled())config.autoAdvance=false;
     int scenarioExitCode=0;
     auto writeScenario=[&](const char* state,uint32_t frame,double elapsed){
@@ -712,7 +712,7 @@ int main(int argc, char** argv) {
             if(update.release>=0){g_gamepad.button(button(update.release),false,fo2InRace(),padSetKey);publishGamepad();}
             if(update.press>=0){
                 g_gamepad.button(button(update.press),true,false,padSetKey);publishGamepad();
-                std::printf("[FO2 SCENARIO] step %u/8: %s\n",autoScenario.step(),update.press==1?"right":"confirm");
+                std::printf("[FO2 SCENARIO] step %u/%u: %s\n",autoScenario.step(),autoScenario.steps(),update.press==1?"right":"confirm");
             }
             if(update.capture)requestD3D9Screenshot();
             if(update.ready)writeScenario("ready",getD3D9PresentCount(),seconds);
