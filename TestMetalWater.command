@@ -9,9 +9,11 @@ export FO2_RT_PREFLIGHT=0 FO2_RT_GEOMETRY_CAPTURE=0
 export FO2_RT_SCENE_CHECK=1
 export FO2_RT_LIVE_DIAGNOSTIC=1
 export FO2_RT_WATER=0
+auto_race=0
 while (( $# )); do
     case "$1" in
         --rt-water) export FO2_RT_WATER=1 FO2_RT_LIVE_DIAGNOSTIC=0 FO2_RT_PREFLIGHT=1 FO2_LAUNCH_PROFILE=water-rt; shift ;;
+        --auto-race) auto_race=1; shift ;;
         --mask) export FO2_LAUNCH_PROFILE=water-mask FO2_DEBUG_VIEW=ssr-mask; shift ;;
         --rt-check) export FO2_RT_PREFLIGHT=1; shift ;;
         --rt-capture) export FO2_RT_GEOMETRY_CAPTURE=1; shift ;;
@@ -43,4 +45,5 @@ if [[ "${FO2_WATER_PHYSICS_TRACE:-1}" == 1 && -f gamedata/data.bfs ]]; then
 else
     unset FO2_WATER_PHYSICS_SIGNATURES
 fi
+if (( auto_race )); then exec ./TestMetal.command --auto-race "$@"; fi
 exec ./TestMetal.command "$@"

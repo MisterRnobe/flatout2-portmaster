@@ -4,6 +4,8 @@ cd "$(dirname "$0")"
 export FO2_TEST_SCENARIO=manual
 export FO2_GAME_DIR="$PWD/gamedata"
 unset FO2_TEST_LEVEL FO2_SCENARIO_STATUS FO2_AUTOPRESS NFSU2_KEY_SCRIPT FO2_AUTORESET NFSU2_AUTODRIVE
+auto_race=0
+if [[ "${1:-}" == --auto-race ]]; then auto_race=1; shift; fi
 mkdir -p work/metal/shaders work/metal/captures
 export FO2_LAUNCH_PROFILE="${FO2_LAUNCH_PROFILE:-check}"
 export FO2_METAL_SESSION_DIR="${FO2_METAL_SESSION_DIR:-$PWD/work/metal/runs/$(date -u +%Y%m%dT%H%M%SZ)-$FO2_LAUNCH_PROFILE-$$}"
@@ -13,7 +15,14 @@ exec > >(tee work/metal/check.log "$FO2_METAL_SESSION_DIR/check.log") 2>&1
 trap 'result=$?; if (( result != 0 )); then echo "Metal check failed ($result). Logs: $FO2_METAL_SESSION_DIR"; if [[ -t 0 ]]; then read -r -p "Press Enter to close…" || true; fi; fi' EXIT
 echo "Metal test profile: $FO2_LAUNCH_PROFILE"
 echo "Session logs: $FO2_METAL_SESSION_DIR"
-echo "Manual selection. Saves: $FO2_GAME_DIR/Savegame"
+if (( auto_race )); then
+    export FO2_GAME_DIR="$(python3 scripts/prepare_test_scenario.py --source "$PWD/gamedata" --session "$FO2_METAL_SESSION_DIR" --seed "$PWD/work/metal/scenarios/rt-auto-race/seed")"
+    export FO2_TEST_SCENARIO=auto-race FO2_TEST_LEVEL=water-canal
+    export FO2_SCENARIO_STATUS="$FO2_METAL_SESSION_DIR/scenario-status.json"
+    echo "Automatic Water Canal 1 race. Isolated saves: $FO2_GAME_DIR/Savegame"
+else
+    echo "Manual selection. Saves: $FO2_GAME_DIR/Savegame"
+fi
 export MTL_DEBUG_LAYER=1
 export MTL_SHADER_VALIDATION=1
 export MTL_SHADER_VALIDATION_REPORT_TO_STDERR=1
