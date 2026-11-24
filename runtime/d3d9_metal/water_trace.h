@@ -77,6 +77,7 @@ public:
  uint32_t offscreenMaterialHitCount()const{return lastOffscreenMaterialHits;}
  uint32_t rayOnlyMaterialHitCount()const{return lastRayOnlyMaterialHits;}
  uint32_t detachedMaterialHitCount()const{return lastDetachedHits;}
+ void useCarWorklist(bool enabled){carShading.useWorklist(enabled);}
  WaterTrace(id<MTLDevice> value,bool checking=false):device(value),fixture(checking),carShading(value){@autoreleasepool{
    traceRequire(device&&device.supportsRaytracing,"Water RT unavailable on this device");
    queue=[device newCommandQueue];traceRequire(queue!=nil,"Water RT queue allocation failed");
@@ -120,7 +121,8 @@ public:
      if(fixture)throw;carsEnabled=false;std::fprintf(stderr,"[FO2 RT CAR] Disabled material path: %s; screen-radiance RT retained\n",error.what());}
    size_t carBytes=0;for(auto& car:cars)carBytes+=car.range.vertices*(64+96);
    unsigned rayOnlyMaterials=0,detachedMaterials=0;for(auto& car:cars){rayOnlyMaterials+=car.range.material->effects[62]>0;detachedMaterials+=car.range.material->effects[61]>0;}
-   size_t resident=vb+ib+hitBytes+carBytes+output.allocatedSize+40;
+   size_t workBytes=cars.empty()?0:(carShading.worklistEnabled()?traceCarWorklistBytes(s.indices.size()/3,w*h,cars.size()):cars.size()*16+4);
+   size_t resident=vb+ib+hitBytes+carBytes+workBytes+output.allocatedSize+40;
    traceRequire(resident<limit&&ps.accelerationStructureSize<limit-resident&&
       ps.buildScratchBufferSize<limit-resident-ps.accelerationStructureSize,"Water RT BLAS memory budget exceeded");
    auto primitive=build(pd);
@@ -136,7 +138,7 @@ public:
    [encoder setTexture:depth atIndex:0];[encoder setTexture:color atIndex:1];[encoder setTexture:normals atIndex:2];[encoder setTexture:water atIndex:3];[encoder setTexture:output atIndex:4];
    NSUInteger threads=std::min(NSUInteger(64),pipeline.maxTotalThreadsPerThreadgroup);
    [encoder dispatchThreads:MTLSizeMake(w,h,1) threadsPerThreadgroup:MTLSizeMake(threads,1,1)];[encoder endEncoding];
-   carShading.encode(command,cars,indices,hits,counters,output);traceWait(command);
+   auto work=carShading.encode(command,cars,indices,hits,counters,output);traceWait(command);carShading.completed(work,cars.size());
    ++completed;auto counts=static_cast<const uint32_t*>(counters.contents);lastWaterRays=counts[0];
    traceRequire(counts[4]<=counts[1]&&counts[1]<=counts[0]&&counts[0]<=w*h,"Water RT invalid counters");
    traceRequire(counts[6]<=counts[5]&&counts[5]<=counts[1],"Water RT invalid material counters");
@@ -152,6 +154,8 @@ public:
          @"source_frame":@(snapshot.frame),@"display_frame":@(displayFrame),@"completed_frames":@(completed),
          @"full_scene_coverage":@NO,@"offscreen_radiance_supported":@(!cars.empty()),@"car_material_draws":@(cars.size()),
          @"acceleration_structure_mode":@"direct-primitive",@"rt_queue_submissions_per_frame":@2,
+         @"car_worklist_enabled":@(carShading.worklistEnabled()),@"car_worklist_bytes":@(workBytes),
+         @"car_shade_candidate_threads":@(carShading.candidateThreads()),@"car_full_grid_candidate_threads":@(carShading.baselineThreads()),
          @"material_budget_drops":@(snapshot.carMaterialBudgetDrops),@"material_evictions":@(snapshot.carMaterialEvictions),@"material_invalid":@(snapshot.carMaterialInvalid),
          @"car_material_hits":@(counts[5]),@"car_nonscreen_hits":@(counts[6]),@"car_offscreen_hits":@(counts[7]),@"triangles":@(s.indices.size()/3),@"unknown_draws":@(snapshot.unknown),
          @"ray_only_draws":@(snapshot.rayOnlyDraws),@"ray_only_material_hits":@(counts[8]),
@@ -254,11 +258,28 @@ int checkMetalWaterTrace(){@autoreleasepool{
  traceRequire(blue>20&&trace.materialHitCount()==blue&&trace.offscreenMaterialHitCount()>0,"RT car offscreen material shading missing");
  traceRequire(trace.rayOnlyMaterialHitCount()==blue,"RT car lost ray-only hit provenance");
  traceRequire(trace.detachedMaterialHitCount()==blue,"RT car lost detached-part hit provenance");
+ // Compare actual GPU output/counters with the retained full-grid path, then
+ // split the mesh across materials to exercise prefix ranges and scatter.
+ trace.useCarWorklist(false);
+ auto fullGrid=read(trace.render(snapshot,42,c,opaque,color,normals,water,resolve,sampler));
+ traceRequire(fullGrid==shaded&&trace.materialHitCount()==blue,"RT car worklist/full-grid mismatch");
+ trace.useCarWorklist(true);snapshot.cars={{material,0,1,0,4},{material,1,1,0,4}};
+ auto split=read(trace.render(snapshot,42,c,opaque,color,normals,water,resolve,sampler));
+ traceRequire(split==shaded&&trace.materialHitCount()==blue&&trace.detachedMaterialHitCount()==blue,"RT car worklist split material mismatch");
+ auto originalIndices=snapshot.scene.indices,originalIds=snapshot.scene.meshIds;
+ snapshot.scene.indices.clear();snapshot.scene.meshIds.clear();snapshot.cars.clear();
+ for(uint32_t i=0;i<64;++i){
+   auto at=(i%2)*3;snapshot.scene.indices.insert(snapshot.scene.indices.end(),originalIndices.begin()+at,originalIndices.begin()+at+3);
+   snapshot.scene.meshIds.push_back(i);snapshot.cars.push_back({material,i,1,0,4});
+ }
+ auto saturated=read(trace.render(snapshot,42,c,opaque,color,normals,water,resolve,sampler));
+ traceRequire(saturated==shaded&&trace.materialHitCount()==blue,"RT car worklist 64-material mismatch");
+ snapshot.scene.indices=std::move(originalIndices);snapshot.scene.meshIds=std::move(originalIds);snapshot.cars={{material,0,2,0,4}};
  ++material->textures[0]->version;empty(read(trace.render(snapshot,42,c,opaque,color,normals,water,resolve,sampler)));
  traceRequire(trace.materialHitCount()==0,"RT car reused a changed texture version");snapshot.cars.clear();
  for(auto& p:snapshot.scene.positions)p[2]=-100;empty(render()); // Out of finite ray range.
  bool staleRejected=false;try{trace.render(snapshot,43,c,opaque,color,normals,water);}catch(const std::exception&){staleRejected=true;}
  traceRequire(staleRejected,"Water RT accepted stale frame");
- std::puts("[FO2 RT WATER CHECK] passed: reflected wall, independent CPU ray, non-water, foreground/water occlusion, finite range, D3D9 half-pixel bias, stale-frame rejection and offscreen textured car material independent of screen radiance");return 0;
+ std::puts("[FO2 RT WATER CHECK] passed: reflected wall, independent CPU ray, non-water, foreground/water occlusion, finite range, D3D9 half-pixel bias, stale-frame rejection, offscreen textured car material and exact worklist/full-grid/64-material agreement");return 0;
 }}
 }

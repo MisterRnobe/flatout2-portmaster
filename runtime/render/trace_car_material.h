@@ -89,14 +89,18 @@ kernel void traceCarVertices(constant fo2_vertex_Uniforms& vu [[buffer(0)]],
 kernel void traceCarShade(constant fo2_fragment_Uniforms& pu [[buffer(1)]],constant float* fx [[buffer(2)]],
  device const CarVaryings* varyings [[buffer(3)]],device const uint* indices [[buffer(4)]],
  device const CarHit* hits [[buffer(5)]],constant uint4& range [[buffer(6)]],device atomic_uint* counts [[buffer(7)]],
+ device const uint* activePixels [[buffer(8)]],device const uint4* workRanges [[buffer(9)]],constant uint& materialIndex [[buffer(10)]],
  texture2d<float> s0_texture [[texture(0)]],sampler s0 [[sampler(0)]],
  texturecube<float> s1_texture [[texture(1)]],sampler s1 [[sampler(1)]],
  texture2d<float> s2_texture [[texture(2)]],sampler s2 [[sampler(2)]],
  texturecube<float> s3_texture [[texture(3)]],sampler s3 [[sampler(3)]],
  texture2d<float,access::write> output [[texture(4)]],uint2 p [[thread_position_in_grid]]){
- uint2 size=uint2(output.get_width(),output.get_height());if(any(p>=size))return;
+ uint2 size=uint2(output.get_width(),output.get_height());
+ auto work=workRanges[materialIndex];
+ if(work.z){if(p.x>=work.y)return;uint pixel=activePixels[work.x+p.x];if(pixel>=size.x*size.y)return;p=uint2(pixel%size.x,pixel/size.x);}
+ if(any(p>=size))return;
  auto h=hits[p.y*size.x+p.x];if(!h.identity.x)return;uint primitive=h.identity.x-1;
- if(primitive<range.x||primitive>=range.x+range.y||h.baryConfidence.z<=0)return;
+ if(primitive<range.x||primitive>=range.x+range.y||!isfinite(h.baryConfidence.z)||h.baryConfidence.z<=0)return;
  uint3 ix=uint3(indices[primitive*3],indices[primitive*3+1],indices[primitive*3+2])-range.z;
  if(any(ix>=range.w))return;
  auto a=varyings[ix.x],b=varyings[ix.y],c=varyings[ix.z];
@@ -118,6 +122,31 @@ kernel void traceCarShade(constant fo2_fragment_Uniforms& pu [[buffer(1)]],const
  if(h.identity.y==1)atomic_fetch_add_explicit(counts+7,1u,memory_order_relaxed);
  if(fx[62]>0)atomic_fetch_add_explicit(counts+8,1u,memory_order_relaxed);
  if(fx[61]>0)atomic_fetch_add_explicit(counts+9,1u,memory_order_relaxed);
+}
+// One histogram/scatter visit per hit pixel, rather than a full grid per
+// material. Prefix is deliberately a single bounded (<=64) serial scan.
+kernel void traceCarCount(device const CarHit* hits [[buffer(0)]],device const uint* owners [[buffer(1)]],
+ device atomic_uint* histogram [[buffer(2)]],constant uint4& limits [[buffer(3)]],uint pixel [[thread_position_in_grid]]){
+ if(pixel>=limits.x)return;auto h=hits[pixel];
+ if(!h.identity.x||!isfinite(h.baryConfidence.z)||h.baryConfidence.z<=0||h.identity.x-1>=limits.y)return;
+ uint material=owners[h.identity.x-1];if(material<limits.z)atomic_fetch_add_explicit(histogram+material,1u,memory_order_relaxed);
+}
+kernel void traceCarPrefix(device atomic_uint* histogram [[buffer(0)]],device uint4* ranges [[buffer(1)]],
+ device uint* indirect [[buffer(2)]],constant uint4& limits [[buffer(3)]],uint tid [[thread_position_in_grid]]){
+ if(tid)return;uint offset=0;
+ for(uint i=0;i<limits.z;++i){uint count=atomic_load_explicit(histogram+i,memory_order_relaxed);
+  count=min(count,limits.x-offset);ranges[i]=uint4(offset,count,1,0);offset+=count;
+  indirect[i*3]=max(1u,(count+limits.w-1)/limits.w);indirect[i*3+1]=1;indirect[i*3+2]=1;
+ }
+}
+kernel void traceCarScatter(device const CarHit* hits [[buffer(0)]],device const uint* owners [[buffer(1)]],
+ device atomic_uint* cursors [[buffer(2)]],device const uint4* ranges [[buffer(3)]],device uint* pixels [[buffer(4)]],
+ constant uint4& limits [[buffer(5)]],uint pixel [[thread_position_in_grid]]){
+ if(pixel>=limits.x)return;auto h=hits[pixel];
+ if(!h.identity.x||!isfinite(h.baryConfidence.z)||h.baryConfidence.z<=0||h.identity.x-1>=limits.y)return;
+ uint material=owners[h.identity.x-1];if(material>=limits.z)return;
+ uint slot=atomic_fetch_add_explicit(cursors+material,1u,memory_order_relaxed);auto range=ranges[material];
+ if(slot<range.y&&range.x+slot<limits.x)pixels[range.x+slot]=pixel;
 }
 )MSL";
 }
