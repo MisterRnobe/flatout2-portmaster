@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """Stage a portable Apple Silicon bundle from the verified game and local dependencies."""
+import argparse
 import hashlib
 import json
+import re
 from pathlib import Path
 import re
 import shutil
 import struct
 import subprocess
 ROOT=Path(__file__).resolve().parents[1]
-STAGE=ROOT/'work/dist/FlatOut2-macOS-arm64'
+parser=argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--renderer',choices=['gles','metal'],default='gles')
+args=parser.parse_args()
+METAL=args.renderer=='metal'
+STAGE=ROOT/('work/dist/FlatOut2-Metal-macOS-arm64' if METAL else 'work/dist/FlatOut2-macOS-arm64')
 SDK=ROOT/'work/portable-sdk/lib'
 
 def run(*args):subprocess.run(list(map(str,args)),check=True)
@@ -24,19 +30,25 @@ def command(name,text):
 
 STAGE.mkdir(parents=True,exist_ok=True)
 lib=STAGE/'bin/lib';lib.mkdir(parents=True,exist_ok=True)
-copy(ROOT/'work/macos/fo2',STAGE/'bin/fo2')
-for name in ['libEGL.dylib','libGLESv2.dylib','libavcodec.62.dylib','libavutil.60.dylib']:
+copy(ROOT/('work/metal/fo2-metal' if METAL else 'work/macos/fo2'),STAGE/'bin/fo2')
+for name in (['libavcodec.62.dylib','libavutil.60.dylib'] if METAL else ['libEGL.dylib','libGLESv2.dylib','libavcodec.62.dylib','libavutil.60.dylib']):
     copy(ROOT/'work/macos/lib'/name,lib/name)
 copy(SDK/'libSDL2-2.0.0.dylib',lib/'libSDL2-2.0.0.dylib')
 copy(SDK/'libSDL3.0.dylib',lib/'libSDL3.dylib')
 run('install_name_tool','-change','/opt/homebrew/opt/sdl2-compat/lib/libSDL2-2.0.0.dylib',
     '@rpath/libSDL2-2.0.0.dylib',STAGE/'bin/fo2')
+# Development binaries use local dependency directories; the bundle resolves only its own libs.
+if METAL:
+    commands=subprocess.check_output(['otool','-l',str(STAGE/'bin/fo2')],text=True)
+    for path in re.findall(r'\bpath (/.+?) \(offset',commands):
+        run('install_name_tool','-delete_rpath',path,STAGE/'bin/fo2')
 for p in lib.glob('*.dylib'):
     run('install_name_tool','-id','@rpath/'+p.name,p)
     run('codesign','--force','--sign','-',p)
 run('codesign','--force','--sign','-',STAGE/'bin/fo2')
 for name in ['FlatOut2.exe','d3dx9_30.dll','filesystem','data.bfs','zoom_platform.bfs']:
     target=STAGE/'gamedata'/name
+    target.parent.mkdir(parents=True,exist_ok=True)
     if not target.exists():run('cp','-c',ROOT/'gamedata'/name,target)
 saves=STAGE/'gamedata/Savegame';saves.mkdir(parents=True,exist_ok=True)
 # Device configuration contains only display/audio settings, not the player profile.
@@ -69,6 +81,18 @@ log="logs/${FO2_LOG_NAME:-play}.log"
 if [[ -f "$log" ]]; then cp "$log" "${log%.log}.previous.log"; fi
 ./bin/fo2 "$PWD/gamedata" --windowed --cap60 "$@" 2>&1 | tee "$log"
 ''')
+if METAL:
+    launcher=STAGE/'Play.command'
+    launcher.write_text('\n'.join(line for line in launcher.read_text().replace('FO2_SKIP_LOGO:-0','FO2_SKIP_LOGO:-1').splitlines() if not line.startswith(('export ANGLE_','export SDL_OPENGL','export SDL_EGL','export SDL_VIDEO_GL')))+'\n')
+    launcher.write_text(launcher.read_text().replace('export FO2_SKIP_LOGO=', 'export FO2_SKIP_INTRO="${FO2_SKIP_INTRO:-1}"\nexport FO2_SKIP_LOGO=',1))
+    command('TestMetal.command',"""#!/bin/bash
+set -euo pipefail
+cd "$(dirname "$0")"
+mkdir -p logs
+export MTL_DEBUG_LAYER=1
+export MTL_SHADER_VALIDATION=1
+./bin/fo2 --metal-check 2>&1 | tee logs/metal-check.log
+""")
 command('Test.command',r'''#!/bin/bash
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -98,11 +122,15 @@ F10 закрывает игру. Вход в чужое интернет-лоб�
 
 Для смены языка из Terminal: NFSU2_LANG=English ./Play.command
 ''')
+if METAL:
+    readme=STAGE/'ПРОЧИТАЙ.txt'
+    readme.write_text(readme.read_text().replace('проверена на macOS 26.6.2 / M3 Pro.','экспериментальный native Metal backend. Проверка игрового изображения ещё требуется.').replace('графика через ANGLE Metal.','графика напрямую через Metal. Сначала запусти TestMetal.command.'))
 licenses=STAGE/'licenses';licenses.mkdir(exist_ok=True)
 for src,name in [(ROOT/'LICENSE','port-MIT.txt'),(ROOT/'third_party/mojoshader/LICENSE.txt','MojoShader.txt'),
     (ROOT/'work/portable-sdl3-src/LICENSE.txt','SDL3.txt'),(ROOT/'work/portable-sdl2-src/LICENSE.txt','SDL2-compat.txt'),
     (ROOT/'work/ffmpeg/COPYING.LGPLv2.1','FFmpeg-LGPL-2.1.txt'),
     (Path('/Applications/Visual Studio Code.app/Contents/Resources/LICENSES.chromium.html'),'ANGLE-Chromium-notices.html')]:
+    if METAL and name=='ANGLE-Chromium-notices.html':continue
     copy(src,licenses/name)
 run('git','-C',ROOT/'work/ffmpeg','archive','--format=tar.gz','--output='+str(licenses/'ffmpeg-8.0.1-source.tar.gz'),'HEAD')
 (licenses/'FFmpeg-build.txt').write_text('''FFmpeg n8.0.1, commit 894da5ca7d742e4429ffb2af534fcda0103ef593, unmodified source included.

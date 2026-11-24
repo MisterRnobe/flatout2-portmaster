@@ -24,7 +24,7 @@ constexpr uint32_t wsaEinval=10022,wsaEwouldblock=10035,wsaEnotsock=10038,wsaEfa
     wsaEtimedout=10060,wsaEafnosupport=10047,wsaNotinitialised=10093,wsaHostNotFound=11001,wsaNoData=11004;
 constexpr char localHostName[]="nfsu2-android";
 // icmp: a Windows raw ICMP socket (ping) on an unprivileged Linux ping socket; see icmpReceive.
-struct Socket{uint32_t traceSend=0,traceRecv=0;int fd;int connectError=0;bool guestNonBlocking=false,connecting=false,icmp=false;uint16_t icmpId=0;uint32_t recvTimeout=0,sendTimeout=0;std::set<std::string> peersLogged;
+struct Socket{uint32_t traceSend=0,traceRecv=0,traceSendAttempts=0,traceRecvAttempts=0,traceId=0;mutable uint32_t qrTraceSend=0,qrTraceRecv=0;int fd;int connectError=0;bool guestNonBlocking=false,connecting=false,icmp=false;uint16_t icmpId=0;uint32_t recvTimeout=0,sendTimeout=0;std::set<std::string> peersLogged;
     struct Counter{uint32_t sentPackets=0,sentBytes=0,receivedPackets=0,receivedBytes=0;};
     std::map<std::string,Counter> traffic;std::chrono::steady_clock::time_point nextSummary{};};
 std::map<uint32_t,Socket> sockets;
@@ -97,27 +97,46 @@ bool storeAddress(uint32_t address,uint32_t lengthPointer,const sockaddr_storage
 }
 uint32_t newHandle(int fd,bool nonBlocking){
     uint32_t handle=nextHandle;nextHandle+=4;
-    Socket value{};value.fd=fd;value.guestNonBlocking=nonBlocking;sockets[handle]=std::move(value);return handle;
+    Socket value{};value.traceId=handle;value.fd=fd;value.guestNonBlocking=nonBlocking;sockets[handle]=std::move(value);return handle;
 }
-bool traceEnabled(){static const bool enabled=std::getenv("FO2_NET_TRACE")!=nullptr;return enabled;}
+bool traceEnabled(){static const bool enabled=[] {const char* value=std::getenv("FO2_NET_TRACE");return value&&*value&&std::strcmp(value,"0");}();return enabled;}
+std::string describe(const sockaddr_storage& address);
+std::filesystem::path traceFolder(){
+    const char* directory=std::getenv("FO2_NET_TRACE_DIR");
+    return directory&&*directory?std::filesystem::path(directory):std::filesystem::path("work/macos/network-trace")/std::to_string(getpid());
+}
 void traceStream(uint32_t handle,Socket& socket,bool sent,const void* data,uint32_t requested,ssize_t result,int error,uint32_t flags){
     if(!traceEnabled())return;
     int type=0;socklen_t size=sizeof type;
     if(::getsockopt(socket.fd,SOL_SOCKET,SO_TYPE,&type,&size)||type!=SOCK_STREAM)return;
     auto& sequence=sent?socket.traceSend:socket.traceRecv;
-    const uint32_t packet=sequence++;
-    if(packet>=32)return;
+    auto& attempts=sent?socket.traceSendAttempts:socket.traceRecvAttempts;
+    if(result<=0){if(attempts>=16)return;++attempts;}
+    else if(sequence>=32)return;
+    const uint32_t packet=result>0?sequence++:0;
     NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","NET TRACE %s socket=%08x requested=%u result=%lld errno=%d WSA=%u flags=%x",sent?"send":"recv",handle,requested,static_cast<long long>(result),result<0?error:0,result<0?wsaError(error):0,flags);
     if(result<=0)return;
     sockaddr_in peer{};size=sizeof peer;
-    if(::getpeername(socket.fd,reinterpret_cast<sockaddr*>(&peer),&size)||ntohs(peer.sin_port)!=28910)return;
-    // Capture only GameSpy master-list traffic, bounded to 32 calls per socket.
-    const std::filesystem::path folder=std::filesystem::path("work/macos/network-trace")/std::to_string(getpid());
+    if(::getpeername(socket.fd,reinterpret_cast<sockaddr*>(&peer),&size)||peer.sin_family!=AF_INET||ntohs(peer.sin_port)!=28910)return;
+    const auto folder=traceFolder();
     std::error_code ec;std::filesystem::create_directories(folder,ec);
     char name[64];std::snprintf(name,sizeof name,"%08x-%s-%03u.bin",handle,sent?"send":"recv",packet);
     std::ofstream capture(folder/name,std::ios::binary);
     capture.write(static_cast<const char*>(data),std::min<ssize_t>(result,65536));
     if(capture)NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","NET TRACE captured %s",(folder/name).string().c_str());
+}
+void traceDatagram(const Socket& socket,bool sent,const void* data,size_t length,const sockaddr_storage& address){
+    if(!traceEnabled()||!length||address.ss_family!=AF_INET)return;
+    const auto& peer=*reinterpret_cast<const sockaddr_in*>(&address);
+    if(ntohs(peer.sin_port)!=27900)return; // QR master only; no player traffic.
+    auto& sequence=sent?socket.qrTraceSend:socket.qrTraceRecv;
+    if(sequence>=32)return;
+    const auto* bytes=static_cast<const uint8_t*>(data);
+    const auto folder=traceFolder()/"qr2";std::error_code ec;std::filesystem::create_directories(folder,ec);
+    char name[64];std::snprintf(name,sizeof name,"%08x-%s-%03u.bin",socket.traceId,sent?"tx":"rx",sequence++);
+    std::ofstream capture(folder/name,std::ios::binary);capture.write(static_cast<const char*>(data),std::min<size_t>(length,2048));
+    unsigned type=bytes[0];if(length>=3&&bytes[0]==0xfe&&bytes[1]==0xfd)type=bytes[2];
+    NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","NET TRACE QR %s socket=%08x bytes=%zu type=%02x peer=%s",sent?"send":"recv",socket.traceId,length,type,describe(address).c_str());
 }
 uint16_t checksum(const uint8_t* data,size_t length){
     uint32_t sum=0;
@@ -272,12 +291,13 @@ void socketConnect(){
     auto* in=reinterpret_cast<sockaddr_in*>(&address);char text[INET_ADDRSTRLEN]{};inet_ntop(AF_INET,&in->sin_addr,text,sizeof text);
     NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Winsock: connect %08x to %s:%u",handle,text,ntohs(in->sin_port));
     socket->connectError=0;
-    if(::connect(socket->fd,reinterpret_cast<sockaddr*>(&address),length)==0){ret(0,3);return;}
+    if(::connect(socket->fd,reinterpret_cast<sockaddr*>(&address),length)==0){if(net::traceEnabled())NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","NET TRACE connect socket=%08x completed immediately",handle);ret(0,3);return;}
     if(errno!=EINPROGRESS){
         const int error=errno;
         NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU2","Winsock: connect %08x failed: errno=%d (%s), WSA=%u",handle,error,std::strerror(error),net::wsaError(error));
         ret(net::fail(net::wsaError(error)),3);return;
     }
+    if(net::traceEnabled())NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","NET TRACE connect socket=%08x pending guestNonBlocking=%d",handle,int(socket->guestNonBlocking));
     if(socket->guestNonBlocking){socket->connecting=true;ret(net::fail(net::wsaEwouldblock),3);return;}
     int fd=socket->fd;net::wait(fd,POLLOUT,0);
     int error=0;socklen_t size=sizeof error;
@@ -311,7 +331,7 @@ void socketSendTo(){
     if(socket){
         int error=errno;
         if(net::hardError(sent))NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU2","Winsock: sendto %08x -> %s fallo: %s",arg(0),addressLength?net::describe(address).c_str():"(conectado)",std::strerror(error));
-        else if(sent>=0&&addressLength){net::notePeer(*socket,"envia a",net::describe(address),sent);net::count(arg(0),*socket,net::describe(address),true,sent);}
+        else if(sent>=0&&addressLength){net::traceDatagram(*socket,true,data,size_t(sent),address);net::notePeer(*socket,"envia a",net::describe(address),sent);net::count(arg(0),*socket,net::describe(address),true,sent);}
         errno=error;
     }
     ret(sent<0?net::failErrno():uint32_t(sent),6);
@@ -355,7 +375,7 @@ void socketRecvFrom(){
     if(net::hardError(received)){int error=errno;NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU2","Winsock: recvfrom %08x fallo: %s",arg(0),std::strerror(error));errno=error;}
     if(received<0){ret(net::failErrno(),6);return;}
     socket=net::find(arg(0));
-    if(socket&&peerLength){net::notePeer(*socket,"recibe de",net::describe(peer),received);net::count(arg(0),*socket,net::describe(peer),false,received);}
+    if(socket&&peerLength){net::traceDatagram(*socket,false,data,std::min<size_t>(size_t(received),length),peer);net::notePeer(*socket,"recibe de",net::describe(peer),received);net::count(arg(0),*socket,net::describe(peer),false,received);}
     if(peerLength&&!net::storeAddress(address,lengthPointer,peer,std::min<socklen_t>(peerLength,16))){ret(net::fail(net::wsaEfault),6);return;}
     if(uint32_t(received)>length){ret(net::fail(net::wsaEmsgsize),6);return;}
     ret(uint32_t(received),6);
@@ -433,6 +453,8 @@ void socketGetOption(){
     }else if(level==IPPROTO_TCP&&name==1)status=::getsockopt(socket->fd,IPPROTO_TCP,TCP_NODELAY,&option,&size);
     else throw GuestStop("getsockopt nivel "+hex(level)+" opcion "+hex(name)+" pendiente desde "+hex(g_cur_func));
     if(status){ret(net::failErrno(),5);return;}
+    if(net::traceEnabled()&&level==0xffffu&&name==0x1007){static unsigned shown=0;if(shown++<64)
+        NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","NET TRACE SO_ERROR socket=%08x WSA=%d",arg(0),option);}
     write32(value,uint32_t(option));write32(lengthPointer,4);ret(0,5);
 }
 // Byte order helpers (x86 hosts are little-endian, network order is big-endian).

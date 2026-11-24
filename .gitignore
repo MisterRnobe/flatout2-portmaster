@@ -36,3 +36,10 @@ __pycache__/
 
 # Local transfer helper contains the personal sync-folder path.
 /CopyToYandex.command
+
+# Local desktop screenshots supplied for debugging.
+/screens/
+
+# Local device backups and Finder metadata must never enter source snapshots.
+/backups/
+.DS_Store

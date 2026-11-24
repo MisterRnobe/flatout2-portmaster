@@ -16,9 +16,11 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--offline',action='store_true',help='Inspect captures without opening sockets')
     parser.add_argument('--since',type=float,default=0,help='Only consider sessions modified since this Unix timestamp')
+    parser.add_argument('--session',type=Path,help='Inspect/replay one explicit trace directory')
     args=parser.parse_args()
     root=ROOT/'work/macos/network-trace'
-    sessions=[p for p in root.glob('*') if p.is_dir() and p.stat().st_mtime>=args.since and queries(p)]
+    candidates=[args.session] if args.session else list(root.glob('*'))
+    sessions=[p for p in candidates if p.is_dir() and p.stat().st_mtime>=args.since and queries(p)]
     if not sessions:
         print('No master-list request captured in this run.');return 2
     session=max(sessions,key=lambda p:p.stat().st_mtime)
@@ -45,7 +47,8 @@ def main():
         except OSError as error:
             failed=True;lines.append(f'{handle}: replay failed: {error}')
     text='\n'.join(lines)+'\n'
-    (ROOT/'work/macos/openspy-replay.log').write_text(text)
+    log=ROOT/'work/macos/openspy-replay.log';log.parent.mkdir(parents=True,exist_ok=True);log.write_text(text)
+    if args.session:(session/'replay.log').write_text(text)
     print(text,end='');print('Log: work/macos/openspy-replay.log')
     return 1 if failed else 0
 if __name__=='__main__':raise SystemExit(main())

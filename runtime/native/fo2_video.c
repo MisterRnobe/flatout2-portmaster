@@ -39,6 +39,7 @@ static int ff_state;   /* 0 not tried, 1 loaded, -1 not available */
 int fo2_video_available(void) {
     static const char* const pairs[][2] = {
 #ifdef __APPLE__
+        {"@executable_path/../Frameworks/libavcodec.62.dylib", "@executable_path/../Frameworks/libavutil.60.dylib"},
         {"@executable_path/lib/libavcodec.62.dylib", "@executable_path/lib/libavutil.60.dylib"},
         {"/opt/homebrew/lib/libavcodec.62.dylib", "/opt/homebrew/lib/libavutil.60.dylib"},
         {"/opt/homebrew/lib/libavcodec.61.dylib", "/opt/homebrew/lib/libavutil.59.dylib"},

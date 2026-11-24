@@ -26,7 +26,7 @@ extern "C" void d3d9NoteGameThread();
 namespace rt {
 enum Op:uint16_t {OpDevice,OpAddRef,OpRelease,OpStateBlock,OpSync,OpFunction,OpRefDelta,OpBufferUpdate,OpTexUpload,OpInstancedDraw,OpSurfaceUpload};
 struct SyncSlot {uint32_t token=0;const uint32_t* args=nullptr;uint32_t count=0;uint32_t result=0;std::exception_ptr error;std::function<void()> fn;std::atomic<bool> done{false};};
-struct Cmd {uint16_t op;uint16_t method;uint32_t a[9];const void* p0;const void* p1;void* obj;void* obj2;SyncSlot* sync;};
+struct Cmd {uint16_t op;uint16_t method;uint32_t a[9];const void* p0;const void* p1;void* obj;void* obj2;SyncSlot* sync;bool rayOnly=false;};
 
 // Ring of queued calls (AS2_QUEUE_BITS, default 16: 65536 calls). A ring small enough for the L2 (12 bits)
 // was measured in Alien Shooter 2: the cache misses on the stores went, but the game thread then waited on a
@@ -87,14 +87,23 @@ std::vector<Object*> refDirty;  // objects with a pending refDelta (Object nodes
 void flushRefDeltas();
 
 void drain();
-const void* copyData(const void* src,size_t bytes){
-    if(!src||!bytes)return src;
+void* allocateData(size_t bytes){
     Arena& a=arenas[arenaIndex];
     if(a.buf.empty())a.buf.resize(8u<<20);  // never used: nothing points into it yet
+    if(bytes>std::numeric_limits<size_t>::max()/2 || a.used>std::numeric_limits<size_t>::max()-15)
+        throw std::runtime_error("D3D9 command arena allocation overflow");
     size_t at=(a.used+15)&~size_t(15);
     // Full: let the render thread consume everything queued (both arenas), then reuse/grow this one.
-    if(at+bytes>a.buf.size()){drain();at=0;a.used=0;if(bytes>a.buf.size())a.buf.resize(bytes*2);}
-    std::memcpy(a.buf.data()+at,src,bytes);a.used=at+bytes;return a.buf.data()+at;
+    if(at>a.buf.size()||bytes>a.buf.size()-at){drain();at=0;a.used=0;if(bytes>a.buf.size())a.buf.resize(bytes*2);}
+    a.used=at+bytes;return a.buf.data()+at;
+}
+const void* copyData(const void* src,size_t bytes){
+    if(!src||!bytes)return src;
+    void* data=allocateData(bytes);std::memcpy(data,src,bytes);return data;
+}
+void copyPair(Cmd& c,const void* first,size_t firstBytes,const void* second,size_t secondBytes){
+    auto pair=fo2render::copyPayloadPair(allocateData,first,firstBytes,second,secondBytes);
+    c.p0=pair.first;c.p1=pair.second;
 }
 
 // Sync calls and Present are notified (the render thread sets the flag, then takes doneMutex and notifies),
@@ -123,13 +132,18 @@ void push(const Cmd& c,bool urgent=false){
     // The ring (5 MB) is far larger than the caches, so every slot is a miss: the slots a few calls ahead are fetched for
     // writing now (push was 6% of the game thread in a race). The render thread does the same for reading (loop).
     {const char* ahead=reinterpret_cast<const char*>(&queue[(h+4)&(queueSize-1)]);__builtin_prefetch(ahead,1,3);__builtin_prefetch(ahead+64,1,3);}
-    queue[h&(queueSize-1)]=c;head.store(h+1,std::memory_order_release);
+    queue[h&(queueSize-1)]=c;
+#ifdef FO2_METAL
+    queue[h&(queueSize-1)].rayOnly=fo2OffcameraRayOnlyDraw()!=0;
+#endif
+    head.store(h+1,std::memory_order_release);
     if(urgent||((h+1)&255u)==0)wake();
 }
 void flushRefDeltas(){
     if(refDirty.empty())return;
-    for(Object* o:refDirty){o->refQueued=false;if(!o->refDelta)continue;Cmd c{};c.op=OpRefDelta;c.obj=o->native;c.a[0]=static_cast<uint32_t>(o->refDelta);push(c);o->refDelta=0;}
-    refDirty.clear();
+    fo2render::flushReferenceDeltas(refDirty,[](IUnknown* native,int32_t delta){
+        Cmd c{};c.op=OpRefDelta;c.obj=native;c.a[0]=static_cast<uint32_t>(delta);push(c);
+    });
 }
 void drain(){
     uint32_t target=head.load(std::memory_order_relaxed);
@@ -287,6 +301,9 @@ void execDevice(const Cmd& c){
 // OpInstancedDraw payload: the register numbers (uint16), then the per-instance data from a 16-byte boundary.
 inline size_t instanceDataOffset(uint32_t registerCount){return (size_t(registerCount)*2+15)&~size_t(15);}
 void exec(const Cmd& c){
+#ifdef FO2_METAL
+    fo2render::RayOnlyScope rayOnly(c.rayOnly);
+#endif
     switch(c.op){
     case OpDevice:execDevice(c);break;
     case OpAddRef:static_cast<IUnknown*>(c.obj)->AddRef();break;
@@ -307,7 +324,7 @@ void exec(const Cmd& c){
             std::vector<uint8_t> pixels;
             if(c.p1){  // decoded by a worker: uploaded as it is, or through LockRect/UnlockRect when the texture needs that
                 std::unique_ptr<DecodeJob> job(static_cast<DecodeJob*>(const_cast<void*>(c.p1)));decodePool.finish(job.get());
-                if(job->pixels.size()==size_t(w)*h*4&&glesUploadDecodedLevel(tex,level,job->pixels.data(),job->rgb565.empty()?nullptr:job->rgb565.data()))break;
+                if(job->pixels.size()==size_t(w)*h*4&&backendUploadDecodedLevel(tex,level,job->pixels.data(),job->rgb565.empty()?nullptr:job->rgb565.data()))break;
                 pixels=std::move(job->pixels);
             }
             else pixels=decodeDXT(t.mode(),w,h,raw.data(),raw.size());
@@ -316,14 +333,24 @@ void exec(const Cmd& c){
                 tex->UnlockRect(level);
             }
         }else if(SUCCEEDED(tex->LockRect(level,&lr,nullptr,0))&&lr.pBits){
-            for(uint32_t row=0;row<c.a[3];++row)std::memcpy(static_cast<uint8_t*>(lr.pBits)+size_t(row)*lr.Pitch,static_cast<const uint8_t*>(c.p0)+size_t(row)*c.a[2],c.a[4]);
+            D3DSURFACE_DESC desc{};
+            if(FAILED(tex->GetLevelDesc(level,&desc)))throw std::runtime_error("D3D9 upload missing texture level");
+            const uint32_t rows=blockCompressed(desc.Format)?(desc.Height+3)/4:desc.Height;
+            if(c.a[4]>rowBytes(desc.Format,desc.Width))throw std::runtime_error("D3D9 texture upload exceeds row width");
+            fo2render::copyUploadRows(lr.pBits,lr.Pitch>0?uint64_t(lr.Pitch)*rows:0,lr.Pitch,
+                                     c.p0,c.a[1],c.a[2],c.a[4],c.a[3]);
             tex->UnlockRect(level);
         }
         break;}
     case OpSurfaceUpload:{  // a[0] pitch, a[1] rows, a[2] row bytes; p0 the whole surface (surfaceLockAsync)
         auto surface=static_cast<IDirect3DSurface9*>(c.obj);D3DLOCKED_RECT lr{};
         if(SUCCEEDED(surface->LockRect(&lr,nullptr,D3DLOCK_DISCARD))&&lr.pBits){
-            for(uint32_t row=0;row<c.a[1];++row)std::memcpy(static_cast<uint8_t*>(lr.pBits)+size_t(row)*lr.Pitch,static_cast<const uint8_t*>(c.p0)+size_t(row)*c.a[0],c.a[2]);
+            D3DSURFACE_DESC desc{};
+            if(FAILED(surface->GetDesc(&desc)))throw std::runtime_error("D3D9 upload missing surface description");
+            const uint32_t rows=blockCompressed(desc.Format)?(desc.Height+3)/4:desc.Height;
+            if(c.a[2]>rowBytes(desc.Format,desc.Width))throw std::runtime_error("D3D9 surface upload exceeds row width: payload="+std::to_string(c.a[2])+" destination="+std::to_string(rowBytes(desc.Format,desc.Width))+" width="+std::to_string(desc.Width)+" height="+std::to_string(desc.Height)+" format="+std::to_string(desc.Format));
+            fo2render::copyUploadRows(lr.pBits,lr.Pitch>0?uint64_t(lr.Pitch)*rows:0,lr.Pitch,
+                                     c.p0,uint64_t(c.a[0])*c.a[1],c.a[0],c.a[2],c.a[1]);
             surface->UnlockRect();
         }
         break;}
@@ -332,7 +359,7 @@ void exec(const Cmd& c){
         auto device=static_cast<IDirect3DDevice9*>(c.obj);const uint32_t count=c.a[6],instances=c.a[7];
         const auto registers=static_cast<const uint16_t*>(c.p0);
         const auto data=reinterpret_cast<const float*>(static_cast<const uint8_t*>(c.p0)+instanceDataOffset(count));
-        if(glesDrawIndexedInstanced(device,c.a,registers,count,instances,data))break;
+        if(backendDrawIndexedInstanced(device,c.a,registers,count,instances,data))break;
         for(uint32_t i=0;i<instances;++i){  // no instanced variant: the same draws one by one
             for(uint32_t j=0;j<count;++j)device->SetVertexShaderConstantF(registers[j],data+(size_t(i)*count+j)*4,1);
             device->DrawIndexedPrimitive(static_cast<D3DPRIMITIVETYPE>(c.a[0]),static_cast<INT>(c.a[1]),c.a[2],c.a[3],c.a[4],c.a[5]);
@@ -366,7 +393,17 @@ void loop(){
         static const bool prof=[]{const char* e=std::getenv("FO2_RT_PROF");return e&&e[0]=='1';}();
         const uint16_t pop=c.op,pmethod=c.method;
         const auto p0=prof?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point();
-        try{exec(c);}catch(const std::exception& e){NFS_RUNTIME_LOG(ANDROID_LOG_ERROR,"NFSU2","render thread: %s",e.what());}
+        try{exec(c);}catch(const std::exception& e){
+#ifdef FO2_METAL
+            static bool reported=false;
+            if(!reported){reported=true;NFS_RUNTIME_LOG(ANDROID_LOG_ERROR,"NFSU2","Metal rendering failed; stopping guest: %s",e.what());}
+            // A failed Present must still release the producer's frame wait.
+            if(c.op==OpDevice&&c.method==17){presentsDone.fetch_add(1,std::memory_order_release);{std::lock_guard<std::mutex> l(doneMutex);}doneCv.notify_all();}
+            requestGuestRuntimeStop();
+#else
+            NFS_RUNTIME_LOG(ANDROID_LOG_ERROR,"NFSU2","render thread: %s",e.what());
+#endif
+        }
         tail.store(t+1,std::memory_order_release);
         if(prof){
             struct Acc{uint64_t ns=0,n=0,slow=0,slowNs=0;};static Acc acc[16][160];static auto last=std::chrono::steady_clock::now();static uint64_t lastPresents=0;
@@ -501,6 +538,9 @@ bool lockBufferAsync(uint32_t kind,const uint32_t* args,uint32_t* count,uint32_t
     uint32_t offset=args[1],size=args[2];
     if(offset>sh.size||(size&&size>sh.size-offset)){*result=D3DERR_INVALIDCALL;return true;}
     if(!size)size=sh.size-offset;
+    // DISCARD invalidates the whole vertex/index buffer, not just the lock
+    // interval. Otherwise the permanent guest mirror re-uploads stale slots.
+    if(args[4]&D3DLOCK_DISCARD)std::memset(pointer(sh.guest),0,sh.size);
     sh.offset=offset;sh.lockSize=size;sh.flags=args[4];sh.locked=true;
     write(args[3],sh.guest+offset);*result=D3D_OK;return true;
 }
@@ -582,8 +622,12 @@ bool textureLockAsync(uint32_t method,const uint32_t* args,uint32_t* count,uint3
 // (UpdateSurface ... ColorFill), Reset, and a lock of the owning texture. A copy belongs to one native surface:
 // a handle reused by another object is caught there (the campaign creates and frees textures by the thousand,
 // so a global epoch would refill every copy every frame). AS2_ASYNC_SURFACE_LOCKS=0: the synchronous path.
-struct SurfaceShadow {uint32_t guest=0,pitch=0,rows=0,rowBytes=0,bpp=0,flags=0,parent=0;IUnknown* native=nullptr;bool locked=false,stale=false;};
+struct SurfaceShadow {uint32_t guest=0,pitch=0,rows=0,rowBytes=0,bpp=0,flags=0,parent=0,serial=0;IUnknown* native=nullptr;bool locked=false,stale=false;};
 std::unordered_map<uint32_t,SurfaceShadow> surfaceShadows;
+// Both allocators can reuse their addresses; object serial distinguishes lifetimes.
+bool surfaceShadowMatches(const SurfaceShadow& shadow,const Object* object){
+    return object&&object->kind==Kind::Surface&&shadow.native==object->native&&shadow.serial==object->serial;
+}
 void dropSurfaceShadows(uint32_t parent=0){   // 0: all of them
     for(auto it=surfaceShadows.begin();it!=surfaceShadows.end();){
         if(parent&&it->second.parent!=parent){++it;continue;}
@@ -595,7 +639,7 @@ void dropSurfaceShadows(uint32_t parent=0){   // 0: all of them
 void sweepSurfaceShadows(){
     for(auto it=surfaceShadows.begin();it!=surfaceShadows.end();){
         Object* o=cachedObject(it->first);
-        if(!it->second.locked&&(!o||o->native!=it->second.native)){freeGuest(it->second.guest);it=surfaceShadows.erase(it);}
+        if(!it->second.locked&&!surfaceShadowMatches(it->second,o)){freeGuest(it->second.guest);it=surfaceShadows.erase(it);}
         else ++it;
     }
 }
@@ -616,7 +660,7 @@ bool surfaceLockAsync(uint32_t method,const uint32_t* args,uint32_t* count,uint3
     Object* self=cachedObject(args[0]);
     auto found=surfaceShadows.find(args[0]);
     // the handle now names another object: the copy is not its pixels
-    if(found!=surfaceShadows.end()&&!found->second.locked&&(!self||self->native!=found->second.native)){
+    if(found!=surfaceShadows.end()&&!found->second.locked&&!surfaceShadowMatches(found->second,self)){
         freeGuest(found->second.guest);surfaceShadows.erase(found);found=surfaceShadows.end();
     }
     if(method==14){  // UnlockRect
@@ -648,7 +692,7 @@ bool surfaceLockAsync(uint32_t method,const uint32_t* args,uint32_t* count,uint3
                 for(uint32_t row=0;row<s.rows;++row)std::memcpy(dst+size_t(row)*s.pitch,static_cast<const uint8_t*>(lr.pBits)+size_t(row)*lr.Pitch,s.rowBytes);
                 native->UnlockRect();ok=true;}});
         if(!ok){freeGuest(s.guest);return false;}
-        s.native=o->native;s.parent=o->parent;found=surfaceShadows.emplace(args[0],s).first;
+        s.native=o->native;s.parent=o->parent;s.serial=o->serial;found=surfaceShadows.emplace(args[0],s).first;
     }
     SurfaceShadow& s=found->second;if(s.locked)return false;
     uint32_t offset=0;
@@ -713,10 +757,10 @@ bool createBufferAsync(IUnknown* deviceObject,uint32_t method,const uint32_t* ar
     if(!asyncBuffersOn()||!args[5]||args[6]||!args[1]||args[1]>(16u<<20))return false;
     auto device=static_cast<IDirect3DDevice9*>(deviceObject);
     IUnknown* native=nullptr;HRESULT status;
-    g_glesDeferBufferGL=true;
+    backendDeferBufferCreation(true);
     if(method==26){IDirect3DVertexBuffer9* b=nullptr;status=device->CreateVertexBuffer(args[1],args[2],args[3],static_cast<D3DPOOL>(args[4]),&b,nullptr);native=b;}
     else{IDirect3DIndexBuffer9* b=nullptr;status=device->CreateIndexBuffer(args[1],args[2],static_cast<D3DFORMAT>(args[3]),static_cast<D3DPOOL>(args[4]),&b,nullptr);native=b;}
-    g_glesDeferBufferGL=false;
+    backendDeferBufferCreation(false);
     if(FAILED(status)||!native)return false;
     const uint32_t handle=wrap(native,method==26?Kind::VertexBuffer:Kind::IndexBuffer);
     write(args[5],handle);
@@ -743,9 +787,9 @@ bool createTextureAsync(IUnknown* deviceObject,const uint32_t* args,uint32_t* co
     // nativeTextureFormat() without its device queries: the GLES device samples no DXT format (CPU decode to RGBA)
     const D3DFORMAT nativeFormat=compressedFormat(requestedFormat)?D3DFMT_A8B8G8R8:requestedFormat;
     auto device=static_cast<IDirect3DDevice9*>(deviceObject);IDirect3DTexture9* texture=nullptr;
-    g_glesDeferTextureGL=true;
+    backendDeferTextureCreation(true);
     const HRESULT status=device->CreateTexture(width,height,levels,usage,nativeFormat,pool,&texture,nullptr);
-    g_glesDeferTextureGL=false;
+    backendDeferTextureCreation(false);
     if(FAILED(status)||!texture)return false;
     const uint32_t handle=wrap(texture,Kind::Texture);
     if(nativeFormat!=requestedFormat){
@@ -775,10 +819,23 @@ void holdSurface(uint32_t h){
     ++o->refDelta;++o->references;heldSurfaces.push_back(h);
 }
 void releaseHeldSurfaces(){   // before Reset: the default surfaces must have no references left
-    for(uint32_t h:heldSurfaces){Object* o=cachedObject(h);if(!o)continue;
+    std::vector<uint32_t> released;released.swap(heldSurfaces);
+    for(uint32_t h:released){Object* o=cachedObject(h);if(!o)continue;
         if(!o->refQueued){o->refQueued=true;refDirty.push_back(o);}
         --o->refDelta;--o->references;}
-    heldSurfaces.clear();
+    // Queue native releases before erasing nodes referenced by refDirty. A
+    // wrapper whose only reference was this hold must not survive Reset:
+    // unbinding the old target can now destroy its native surface.
+    flushRefDeltas();
+    std::lock_guard<std::recursive_mutex> lock(objectsMutex);
+    for(uint32_t h:released){
+        auto found=objects.find(h);
+        if(found==objects.end()||found->second.references||found->second.children)continue;
+        const uint32_t parent=found->second.parent;
+        retireGuestObject(h);
+        if(parent){auto owner=objects.find(parent);
+            if(owner!=objects.end()&&!--owner->second.children&&!owner->second.references)retireGuestObject(parent);}
+    }
 }
 void noteSurfaceQuery(uint32_t method,const uint32_t* args){
     auto at=[](uint32_t address){uint32_t v;std::memcpy(&v,pointer(address),4);return v;};
@@ -816,14 +873,21 @@ __attribute__((always_inline)) inline bool queueDeviceCall(uint32_t method,const
         if(!sparks&&particleStrip(args[1],vertexCount(static_cast<D3DPRIMITIVETYPE>(args[1]),args[3]))){*count=4;return true;}
     }
     if(filterState(method,args,count)){++filtered;return true;}
+#ifdef FO2_METAL
+    // Native bindings own references too. Apply pending guest references
+    // before an unbind can release the last native reference.
+    if(!refDirty.empty())flushRefDeltas();
+#endif
     Cmd c{};c.op=OpDevice;c.method=static_cast<uint16_t>(method);c.obj=device;
     for(int i=0;i<9;++i)c.a[i]=args[i];
         switch(method){
         case 3:*count=1;return true;  // TestCooperativeLevel: never lost here (was a synchronous call every frame)
-        case 37:*count=3;c.obj2=cachedNative<IDirect3DSurface9>(args[2]);viewportKnown=false;  // resets the viewport to the target
+        case 37:*count=3;c.obj2=cachedNative<IDirect3DSurface9>(args[2]);viewportKnown=false;
+            if(args[1]<4){knownTarget[args[1]]=args[2];targetKnown[args[1]]=true;}  // resets the viewport to the target
             if(args[1]==0&&c.obj2){D3DSURFACE_DESC d{};if(SUCCEEDED(static_cast<IDirect3DSurface9*>(c.obj2)->GetDesc(&d))){viewportShadow={0,0,d.Width,d.Height,0.f,1.f};viewportKnown=true;}}
             break;
-        case 39:*count=2;c.obj2=cachedNative<IDirect3DSurface9>(args[1]);break;
+        case 39:*count=2;c.obj2=cachedNative<IDirect3DSurface9>(args[1]);
+            knownDepth=args[1];depthKnown=true;break;
         case 41:case 42:*count=1;break;
         case 43:*count=7;c.p0=args[2]&&args[1]?copyData(pointer(args[2]),size_t(args[1])*sizeof(D3DRECT)):nullptr;break;
         case 44:case 46:*count=3;if(!args[2])return false;c.p0=copyData(pointer(args[2]),sizeof(D3DMATRIX));break;
@@ -848,8 +912,8 @@ __attribute__((always_inline)) inline bool queueDeviceCall(uint32_t method,const
             c.p0=copyData(pointer(args[3]),bytes);break;}
         case 84:{*count=9;if(!args[5]||!args[7])return false;shadow->sbValid[0]=false;shadow->ibValid=false;
             size_t idx=size_t(vertexCount(static_cast<D3DPRIMITIVETYPE>(args[1]),args[4]))*(args[6]==D3DFMT_INDEX16?2:4);
-            size_t vtx=size_t(args[2]+args[3])*args[8];
-            c.p0=copyData(pointer(args[5]),idx);c.p1=copyData(pointer(args[7]),vtx);break;}
+            size_t vtx=(size_t(args[2])+args[3])*args[8];
+            copyPair(c,pointer(args[5]),idx,pointer(args[7]),vtx);break;}
         case 87:*count=2;c.obj2=cachedNative<IDirect3DVertexDeclaration9>(args[1]);break;
         case 89:*count=2;break;
         case 92:*count=2;c.obj2=cachedNative<IDirect3DVertexShader9>(args[1]);break;
@@ -946,7 +1010,8 @@ bool tryDeferImpl(uint32_t kind,uint32_t method,const uint32_t* args,uint32_t* c
         for(int i=0;i<9;++i)c.a[i]=args[i];
         {if(args[4])return false;*count=5;
             static bool noted=false;if(!noted){noted=true;d3d9NoteGameThread();}
-            c.p0=args[1]?copyData(pointer(args[1]),sizeof(RECT)):nullptr;c.p1=args[2]?copyData(pointer(args[2]),sizeof(RECT)):nullptr;
+            copyPair(c,args[1]?pointer(args[1]):nullptr,args[1]?sizeof(RECT):0,
+                       args[2]?pointer(args[2]):nullptr,args[2]?sizeof(RECT):0);
             c.obj2=dxvkAndroidGetWindowHandle();if(!c.obj2)return false;
             flushRefDeltas();
             uint64_t frame=presentsQueued.fetch_add(1)+1;push(c,true);
@@ -987,6 +1052,9 @@ bool tryDeferImpl(uint32_t kind,uint32_t method,const uint32_t* args,uint32_t* c
                 else if(vb->second.has){viewportKnown=vb->second.known;viewportShadow=vb->second.value;}
             }
         }
+#ifdef FO2_METAL
+        if(!refDirty.empty())flushRefDeltas();
+#endif
         Cmd c{};c.op=OpStateBlock;c.method=static_cast<uint16_t>(method);c.obj=block->native;*count=1;push(c);return true;
     }
     // AddRef/Release: the guest-visible count is the bridge's own (see dispatchGuestD3D9Inner); only the
@@ -1221,6 +1289,10 @@ extern "C" int nfsD3dReferenceShortcut(uint32_t kind,uint32_t method,const uint3
 // device's register file does. 0 = not queued (render thread off, or something is being recorded): draw them singly.
 extern "C" int nfsD3dDrawInstanced(const uint32_t* dip,uint32_t registerCount,const uint16_t* registers,uint32_t instances,const float* data){
     using namespace rt;
+#ifdef FO2_METAL
+    // Preserve each instance's world-pointer provenance and current geometry.
+    if(fo2_rt_scene_enabled)return 0;
+#endif
     static const bool off=[]{const char* e=std::getenv("NFSU2_INSTANCING");return e&&e[0]=='0';}();
     if(off||!enabled||!shadow||!deviceNative||passMode||hudRecording||capActive||!registerCount||registerCount>16||instances<2||instances>64)return 0;
     const size_t dataBytes=size_t(instances)*registerCount*16,payloadBytes=instanceDataOffset(registerCount)+dataBytes;

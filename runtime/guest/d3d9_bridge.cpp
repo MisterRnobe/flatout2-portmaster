@@ -1,4 +1,14 @@
 #include "d3d9_bridge.h"
+#include "../render/backend.h"
+#include "../render/row_upload.h"
+#include "../render/command_payload.h"
+#include "../render/reference_deltas.h"
+#ifdef FO2_METAL
+#include "guest_runtime.h"
+#include "../render/ray_only_scope.h"
+extern "C" int fo2OffcameraRayOnlyDraw();
+extern "C" int fo2_rt_scene_enabled;
+#endif
 #include "runtime_log.h"
 #include "dxt_shadow.h"
 #include "vertex_formats.h"
@@ -53,12 +63,6 @@ extern "C" ANativeWindow* dxvkCreateTestWindow();
 extern "C" void dxvkDestroyTestWindow(ANativeWindow* window);
 #endif
 namespace rt{void forgetBufferShadow(uint32_t address);void forgetTextureLocks(uint32_t address);}  // d3d9_render_thread.inc (R36S)
-extern thread_local bool g_glesDeferBufferGL;  // ports/r36s/d3d9_gles: buffers created off the render thread
-extern thread_local bool g_glesDeferTextureGL; // ports/r36s/d3d9_gles: 2D textures created off the render thread
-// ports/r36s/d3d9_gles: upload a whole level already decoded from DXT (false = use LockRect/UnlockRect)
-bool glesUploadDecodedLevel(IDirect3DTexture9* texture,uint32_t level,const uint8_t* rgba,const uint8_t* rgb565);
-// ports/r36s/d3d9_gles: one instanced DrawIndexedPrimitive (false = not drawn: draw the instances one by one)
-bool glesDrawIndexedInstanced(IDirect3DDevice9* device,const uint32_t* dip,const uint16_t* registers,uint32_t count,uint32_t instances,const float* data);
 namespace {
 constexpr uint32_t methodBase=0x7e000000;
 enum class Kind:uint32_t {D3D9=1,Device=2,Texture=3,Cube=4,Surface=5,VertexBuffer=6,IndexBuffer=7,
@@ -480,6 +484,80 @@ static uint32_t dispatchGuestD3D9Inner(uint32_t token,const uint32_t* args,uint3
 }
 
 #include "d3d9_render_thread.inc"
+#ifdef FO2_METAL
+// Exercise the real hold/ref-delta/retirement queue without creating a device.
+// The mock models a surface owned by a binding and by its texture container.
+int fo2CheckMetalBridgeResetCPU(){
+    if(!objects.empty()||rt::running.load()||!rt::heldSurfaces.empty()||!rt::refDirty.empty())
+        throw std::runtime_error("Reset bridge CPU test requires an idle bridge");
+    struct CounterObject : IUnknown {
+        std::atomic<ULONG> refs{1};std::atomic<unsigned>& destroyed;IUnknown* parent;
+        CounterObject(std::atomic<unsigned>& d,IUnknown* p=nullptr):destroyed(d),parent(p){if(parent)parent->AddRef();}
+        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID,void** out) override {if(!out)return E_POINTER;*out=this;AddRef();return S_OK;}
+        ULONG STDMETHODCALLTYPE AddRef() override {return ++refs;}
+        ULONG STDMETHODCALLTYPE Release() override {auto n=--refs;if(!n){if(parent)parent->Release();++destroyed;delete this;}return n;}
+    };
+    static std::vector<uint8_t> guest(8192);static uint32_t next=16;
+    static std::vector<uint32_t> freed;
+    next=16;freed.clear();
+    auto savedBase=guestBase;auto savedAllocate=allocateGuest;auto savedFree=freeGuest;
+    auto savedQueue=rt::queue;const auto savedHead=rt::head.load(),savedTail=rt::tail.load();
+    guestBase=guest.data();
+    allocateGuest=[](uint32_t bytes){uint32_t out=next;next+=(bytes+15)&~15u;
+        if(next>guest.size())throw std::runtime_error("Reset CPU guest allocator exceeded");return out;};
+    freeGuest=[](uint32_t address){freed.push_back(address);};
+    rt::queue=new rt::Cmd[rt::queueSize];rt::head=0;rt::tail=0;
+    std::atomic<unsigned> destroyed{0};
+    auto* parent=new CounterObject(destroyed);
+    auto* surface=new CounterObject(destroyed,parent);
+    const uint32_t parentHandle=wrap(parent,Kind::Texture),surfaceHandle=wrap(surface,Kind::Surface);
+    attachTextureSurface(parentHandle,surfaceHandle);
+    parent->Release();objects.at(parentHandle).references=0; // only the surface owns the native parent
+    surface->AddRef(); // the render target binding; Reset drops it after queued holds
+    bool binding=true;
+    auto cleanup=[&]{
+        // Only this test's objects exist; do not dereference retired native pointers.
+        if(!destroyed.load()){while(rt::tail.load()!=rt::head.load()){
+            auto i=rt::tail.load();rt::exec(rt::queue[i&(rt::queueSize-1)]);rt::tail=i+1;}}
+        if(binding){binding=false;surface->Release();}
+        objects.clear();addresses.clear();handlesRetiredEpoch.fetch_add(1,std::memory_order_release);
+        rt::heldSurfaces.clear();rt::refDirty.clear();delete[] rt::queue;rt::queue=savedQueue;
+        rt::head=savedHead;rt::tail=savedTail;guestBase=savedBase;allocateGuest=savedAllocate;freeGuest=savedFree;
+    };
+    try{
+        // Same guest handle AND same native address can denote a new object.
+        // A video-sized shadow must not survive into a reused small cube face.
+        rt::SurfaceShadow stale;
+        stale.guest=allocateGuest(64);stale.native=surface;stale.serial=objects.at(surfaceHandle).serial;
+        rt::surfaceShadows.emplace(surfaceHandle,stale);
+        rt::sweepSurfaceShadows();
+        if(rt::surfaceShadows.size()!=1)throw std::runtime_error("Live surface shadow was discarded");
+        ++objects.at(surfaceHandle).serial;
+        rt::sweepSurfaceShadows();
+        if(!rt::surfaceShadows.empty()||freed.size()!=1||freed.back()!=stale.guest)
+            throw std::runtime_error("Reused surface address retained stale upload layout");
+        freed.clear();
+        std::puts("[Metal check] CPU surfaces: same guest/native address with new serial discards stale pixel shadow");
+        rt::holdSurface(surfaceHandle);
+        // The caller releases its original reference; its net native delta is
+        // zero, leaving the hold plus the binding as the two native owners.
+        auto& object=objects.at(surfaceHandle);--object.references;--object.refDelta;
+        if(!rt::cachedObject(surfaceHandle))throw std::runtime_error("Reset CPU surface lookup failed");
+        rt::releaseHeldSurfaces();
+        if(!objects.empty()||!addresses.empty()||!rt::heldSurfaces.empty()||!rt::refDirty.empty()||
+           freed.size()!=4||rt::cachedObject(surfaceHandle)||rt::head.load()!=1)
+            throw std::runtime_error("Reset retained a zero-reference surface/parent wrapper");
+        rt::exec(rt::queue[0]);rt::tail=1;
+        if(destroyed.load())throw std::runtime_error("Reset hold release destroyed a still-bound surface");
+        binding=false;surface->Release();
+        if(destroyed.load()!=2)throw std::runtime_error("Reset binding/parent ownership did not retire cleanly");
+        cleanup();
+        std::puts("[Metal check] CPU reset: held surfaces/parents retired, cached handles invalidated, binding ownership preserved");
+        return 0;
+    }catch(...){cleanup();throw;}
+}
+#endif
+
 
 bool dispatchGuestD3D9TryDefer(uint32_t token,const uint32_t* args,uint32_t* argumentCount,uint32_t* result){
 #if defined(NFS_R36S)

@@ -31,4 +31,13 @@ class ReplayTest(unittest.TestCase):
                 self.assertEqual(replay.main(),0)
             self.assertEqual(connection.sent,b'flatout2pc\0query')
             self.assertEqual((session/'0000100c-replay-response.bin').read_bytes(),b'onetwo')
+    def test_explicit_metal_session(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);session=root/'work/metal/runs/check/network-trace';session.mkdir(parents=True)
+            (session/'0000100c-send-000.bin').write_bytes(b'flatout2pc\0query')
+            (session/'qr2').mkdir();(session/'qr2/00001060-tx-000.bin').write_bytes(b'heartbeat')
+            self.assertEqual(len(replay.queries(session)),1)
+            with mock.patch.object(replay,'ROOT',root),mock.patch('sys.argv',['replay','--offline','--session',str(session)]),mock.patch.object(replay.socket,'create_connection') as connect:
+                self.assertEqual(replay.main(),0);connect.assert_not_called()
+            self.assertTrue((session/'replay.log').exists())
 if __name__=='__main__':unittest.main()

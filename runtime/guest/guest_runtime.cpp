@@ -1,3 +1,7 @@
+#include "test_level_script.h"
+#include "water_semantic_trace.h"
+#include "offcamera_car_scene.h"
+static void testOffcameraLiftedScope();
 #include "../host/macos_compat.h"
 extern "C" void nfsInstallCrashHandler();
 #ifndef __APPLE__
@@ -12,6 +16,8 @@ extern "C" void nfsInstallCrashHandler();
 #include "guest_heap.h"
 #include "runtime_log.h"
 #include "frame_pacer.h"
+#include "../render/shader_capture.h"
+#include "../native/fo2_video_options.h"
 #if defined(__ANDROID__) || defined(NFS_D3D9_BACKEND)
 #include "d3d9_bridge.h"
 #include "nfs_widescreen.h"
@@ -840,6 +846,122 @@ void testGuestTimers(){
         NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Timer worker passed: one-shot, periodic, synchronous cancel, pending cancel, retirement and single-thread reuse");
     }catch(...){timerTestActive=false;for(auto& timer:timerHandles)timer.second->cancelled=true;timerHandles.clear();throw;}
 }
+std::vector<std::array<uint32_t,4>> windowDestroyTestEvents;
+uint32_t windowDestroyTestRoot{},windowDestroyTestChild{},windowDestroyTestDestroy{},windowDestroyTestQuit{};
+bool windowDestroyTestValid=true,windowDestroyTestReenter=false;
+uint32_t windowDestroyTestTrigger{};
+void windowDestroyTestProcedure(){
+    const uint32_t handle=arg(0),message=arg(1),wparam=arg(2),lparam=arg(3);
+    windowDestroyTestEvents.push_back({handle,message,wparam,lparam});
+    if((message==2||message==0x82)&&!windows.count(handle))windowDestroyTestValid=false;
+    if(windowDestroyTestTrigger&&windowDestroyTestTrigger==message){windowDestroyTestTrigger=0;
+        if(callGuest(windowDestroyTestDestroy,{handle})!=1)windowDestroyTestValid=false;}
+    if(handle==windowDestroyTestRoot&&message==2){
+        if(!windows.count(windowDestroyTestChild))windowDestroyTestValid=false;
+        if(windowDestroyTestReenter){windowDestroyTestReenter=false;
+            if(callGuest(windowDestroyTestDestroy,{handle})!=1)windowDestroyTestValid=false;}
+        callGuest(windowDestroyTestQuit,{0xf02ee});
+    }
+    if(handle==windowDestroyTestRoot&&message==0x82&&windows.count(windowDestroyTestChild))windowDestroyTestValid=false;
+    ret(message==0x81?1:0,4);
+}
+void testGuestWindowDestruction(){
+    if(!windows.empty())throw GuestStop("Window lifecycle test requires an empty window table");
+    if(windowFunctions.at("DestroyWindow")!=destroyWindow)throw GuestStop("DestroyWindow import not bound");
+    const auto originalImports=imports.size();
+    const uint32_t savedNext=nextWindow,savedActive=activeWindow,savedCapture=captureWindow,
+        savedImport=lastImport,savedError=lastError;
+    const uint32_t procedure=importBase+uint32_t(imports.size())*16;
+    imports.push_back({"selftest!WindowProcedure",windowDestroyTestProcedure});
+    windowDestroyTestDestroy=importBase+uint32_t(imports.size())*16;
+    imports.push_back({"selftest!DestroyWindow",destroyWindow});
+    windowDestroyTestQuit=importBase+uint32_t(imports.size())*16;
+    imports.push_back({"selftest!PostQuitMessage",postQuitMessage});
+    const uint32_t defaultProc=importBase+uint32_t(imports.size())*16;
+    imports.push_back({"selftest!DefWindowProcA",defaultWindowProc});
+    const uint32_t positionProc=importBase+uint32_t(imports.size())*16;
+    imports.push_back({"selftest!SetWindowPos",setWindowPos});
+    const uint32_t createProc=importBase+uint32_t(imports.size())*16;
+    imports.push_back({"selftest!CreateWindowExA",createWindowEx});
+    const std::string className="__FO2_WINDOW_LIFECYCLE_TEST__";
+    windowClasses.emplace(className,GuestWindowClass{0xfeee,procedure,0,0,0,className});
+    std::vector<uint32_t> handles;
+    auto add=[&](uint32_t parent,uint32_t style){
+        uint32_t h=nextWindow++;
+        windows.emplace(h,GuestWindow{procedure,0,style,0,parent,0,42,8,0,0,640,480,true,{}});
+        handles.push_back(h);return h;
+    };
+    auto cleanup=[&]{
+        for(auto h:handles)windows.erase(h);
+        for(auto it=paintContexts.begin();it!=paintContexts.end();)
+            if(std::find(handles.begin(),handles.end(),it->second)!=handles.end())it=paintContexts.erase(it);else ++it;
+        {std::lock_guard<std::mutex> lock(messageMutex);
+            windowMessages.erase(std::remove_if(windowMessages.begin(),windowMessages.end(),[&](const GuestMessage& m){
+                return std::find(handles.begin(),handles.end(),m.hwnd)!=handles.end()||(m.message==0x12&&m.wparam==0xf02ee);
+            }),windowMessages.end());}
+        imports.resize(originalImports);nextWindow=savedNext;activeWindow=savedActive;captureWindow=savedCapture;
+        lastImport=savedImport;lastError=savedError;windowDestroyTestRoot=0;windowDestroyTestTrigger=0;
+        windowClasses.erase(className);windowDestroyTestEvents.clear();
+    };
+    try{
+        windowDestroyTestEvents.clear();windowDestroyTestValid=true;windowDestroyTestReenter=true;
+        const uint32_t root=add(0,0),child=add(root,0x40000000u),other=add(0,0);
+        windowDestroyTestRoot=root;windowDestroyTestChild=child;
+        activeWindow=root;captureWindow=child;
+        paintContexts[0xf007ee01]=root;paintContexts[0xf007ee02]=child;paintContexts[0xf007ee03]=other;
+        {std::lock_guard<std::mutex> lock(messageMutex);
+            for(uint32_t h:{root,child,other})windowMessages.push_back({h,0x400,0,0,messageTime()});}
+        windows.at(root).ownerThread=guestThreadId+1;
+        if(callGuest(windowDestroyTestDestroy,{root})||!windows.count(root)||!windowDestroyTestEvents.empty())
+            throw GuestStop("DestroyWindow accepted a window owned by another thread");
+        windows.at(root).ownerThread=guestThreadId;
+        if(callGuest(windowDestroyTestDestroy,{root})!=1||!windowDestroyTestValid||windows.count(root)||windows.count(child)||
+           !windows.count(other)||activeWindow||captureWindow||paintContexts.count(0xf007ee01)||paintContexts.count(0xf007ee02)||
+           paintContexts.at(0xf007ee03)!=other)throw GuestStop("DestroyWindow cleanup/ownership failed");
+        std::vector<std::pair<uint32_t,uint32_t>> order;
+        bool parentNotify=false;
+        for(const auto& event:windowDestroyTestEvents){
+            if(event[1]==2||event[1]==0x82)order.push_back({event[0],event[1]});
+            if(event[0]==root&&event[1]==0x210&&event[2]==((42u<<16)|2)&&event[3]==child)parentNotify=true;
+        }
+        const std::vector<std::pair<uint32_t,uint32_t>> expected={{root,2},{child,2},{child,0x82},{root,0x82}};
+        if(order!=expected||!parentNotify)throw GuestStop("DestroyWindow callback order/reentry failed");
+        {std::lock_guard<std::mutex> lock(messageMutex);bool quit=false,unrelated=false;
+            for(const auto& m:windowMessages){if(m.hwnd==root||m.hwnd==child)throw GuestStop("Destroyed window retained queued messages");
+                quit|=m.message==0x12&&m.wparam==0xf02ee;unrelated|=m.hwnd==other;}
+            if(!quit||!unrelated)throw GuestStop("DestroyWindow discarded quit/unrelated messages");}
+        if(callGuest(windowDestroyTestDestroy,{root})||lastError!=1400||callGuest(windowDestroyTestDestroy,{0}))
+            throw GuestStop("DestroyWindow invalid handle behavior failed");
+        const uint32_t close=add(0,0);windowDestroyTestEvents.clear();windowDestroyTestRoot=0;
+        if(callGuest(defaultProc,{close,0x10,0,0})||windows.count(close))throw GuestStop("DefWindowProc WM_CLOSE did not destroy window");
+        if(windowDestroyTestEvents.size()!=2||windowDestroyTestEvents[0][1]!=2||windowDestroyTestEvents[1][1]!=0x82)
+            throw GuestStop("WM_CLOSE destruction notifications failed");
+        // Position/creation callbacks may destroy their own window. The
+        // caller must re-resolve the handle rather than use a saved reference.
+        for(uint32_t trigger:{0x46u,0x47u}){
+            const uint32_t moving=add(0,0);windowDestroyTestEvents.clear();windowDestroyTestTrigger=trigger;
+            const uint32_t result=callGuest(positionProc,{moving,0,2,3,320,240,0});
+            if(windows.count(moving)||result!=(trigger==0x46?0u:1u)||!windowDestroyTestValid)
+                throw GuestStop("SetWindowPos retained a window destroyed by its callback");
+            for(const auto& event:windowDestroyTestEvents)if(event[1]==5)
+                throw GuestStop("SetWindowPos sent WM_SIZE after destruction");
+        }
+        windowDestroyTestEvents.clear();windowDestroyTestTrigger=0x81;
+        const uint32_t creating=nextWindow;handles.push_back(creating);
+        if(callGuest(createProc,{0,0xfeee,0,0,0,0,320,240,0,0,0,0})||windows.count(creating))
+            throw GuestStop("CreateWindowEx returned a window destroyed during WM_NCCREATE");
+        for(const auto& event:windowDestroyTestEvents)if(event[1]==1)
+            throw GuestStop("CreateWindowEx sent WM_CREATE after destruction");
+        windowDestroyTestEvents.clear();
+        const uint32_t created=callGuest(createProc,{0,0xfeee,0,0,0,0,320,240,0,0,0,0});
+        if(!created||!windows.count(created))throw GuestStop("CreateWindowEx normal creation failed");
+        handles.push_back(created);
+        if(callGuest(windowDestroyTestDestroy,{created})!=1)throw GuestStop("Created window destruction failed");
+        cleanup();
+        NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Guest window lifecycle passed: owner thread, child notifications, reentry, WM_CLOSE, creation/position callback destruction, capture/paint cleanup and preserved quit messages");
+    }catch(...){cleanup();throw;}
+}
+
 void testGuestFileTime(){
     auto imported=[&](const std::string& name){for(uint32_t i=0;i<imports.size();++i)if(imports[i].name==name)return importBase+i*16;throw GuestStop("File-time import unavailable");};
     uint32_t local=imported("kernel32.dll!FileTimeToLocalFileTime"),system=imported("kernel32.dll!FileTimeToSystemTime");
@@ -1308,6 +1430,7 @@ std::string connectGuestRuntime(const char* executable, bool checkOnly) {
             }
         }
         testGeneratedCallbacks();
+        testGuestWindowDestruction();
 #if 0   // NFSU2's GetRacingResolution self-test
         if(renderWidth.load()&&renderHeight.load()){
             uint32_t outputs=allocate(12);write32(outputs+8,0xdeadbeef);
@@ -1326,6 +1449,7 @@ std::string connectGuestRuntime(const char* executable, bool checkOnly) {
             testGuestSocketAddresses();
             testGuestSocketSelect();
             testLiftedD3DXCompiler();
+            testOffcameraLiftedScope();
             joinGuestThreads(guard);machineLease=nullptr;shutdownGuestSound();
 #if defined(__ANDROID__) || defined(NFS_D3D9_BACKEND)
             shutdownD3D9Bridge();
@@ -1430,6 +1554,17 @@ extern "C" { uint32_t g_recomp_skip_function=0; } // a skippable function return
 // script 512 bytes at a time; at 0x524276 eax is the count just read and esi the buffer. A car's camera.ini starts with
 // "Cameras=" and has five cameras (the other camera files have another count); at its end this text is read as more of
 // the file. Only the language itself is used: the game does not open every Lua library.
+static fo2test::WaterLevelScript waterLevelScript([]{const char* level=std::getenv("FO2_TEST_LEVEL");return level&&std::string(level)=="water-canal";}());
+static std::atomic<bool> waterLevelInjectedReady{false};
+bool fo2TestLevelInjected(){return waterLevelInjectedReady.load(std::memory_order_acquire);}
+static void fo2TestLevelRead(){
+    const uint32_t count=g_eax,buffer=g_esi;
+    if(count>512)return;
+    auto extra=waterLevelScript.read(buffer,std::string_view(count?static_cast<const char*>(ptr(buffer,count)):"",count));
+    waterLevelInjectedReady.store(waterLevelScript.injected(),std::memory_order_release);
+    if(!extra.empty()){std::memcpy(ptr(buffer,extra.size()),extra.data(),extra.size());g_eax=extra.size();
+      std::printf("[FO2 SCENARIO] Water Canal 1 installed into the isolated first race slot\n");}
+}
 static void fo2CameraScriptRead(){
     static const bool on=[]{const char* e=std::getenv("FO2_CAM4");return !e||e[0]!='0';}();
     if(!on)return;
@@ -1481,8 +1616,49 @@ static void fo2EngineSoundGuard(){
         else wf(o+at,0.0f);
     }
 }
+// Opt-in, read-only semantic water observation at the existing physics hook.
+// Never changes game memory or promotes collision candidates to render water.
+#include "offcamera_car_runtime.inc"
+static std::atomic<uint32_t> physicalWaterAsset{0};
+extern "C" uint32_t fo2WaterPhysicalAsset(){return physicalWaterAsset.load(std::memory_order_acquire);}
+static void fo2WaterSemanticTrace(){
+    static const char* signaturesPath=std::getenv("FO2_WATER_PHYSICS_SIGNATURES");
+    static bool disabled=false;static uint64_t ticks=0;static unsigned records=0;static uint32_t previousWorld=0,previousSettings=0;static auto previousCall=std::chrono::steady_clock::time_point{};
+    if(!signaturesPath||!*signaturesPath||disabled)return;
+    try{
+        static const auto signatures=fo2water::loadSignatures(signaturesPath);
+        auto reader=[](uint32_t address,void* destination,size_t size){
+            if(!memory||!memory->readable(address,size))return false;
+            std::memcpy(destination,ptr(address,size),size);return true;
+        };
+        uint32_t physics=0;if(!reader(g_esp+4,&physics,4))return;
+        uint32_t settings=0;reader(0x008DA758u,&settings,4);auto now=std::chrono::steady_clock::now();
+        bool changed=physics!=previousWorld||settings!=previousSettings||(previousCall.time_since_epoch().count()&&now-previousCall>std::chrono::seconds(2));
+        previousCall=now;if(changed){previousWorld=physics;previousSettings=settings;physicalWaterAsset.store(0,std::memory_order_release);}
+        if(++ticks%500!=1&&!changed)return;
+        auto data=fo2water::observe(physics,signatures,reader,false);
+        physicalWaterAsset.store(fo2water::activeCollisionAsset(data),std::memory_order_release);
+        if(records>=128)return;++records;
+        std::ostringstream matches;matches<<'[';
+        for(size_t i=0;i<data.collision.size();++i){if(i)matches<<',';
+            matches<<"{\"asset_index\":"<<data.collision[i].asset<<",\"world_offset\":"<<data.collision[i].offset<<",\"object_pointer\":"<<data.collision[i].object<<",\"indirect\":"<<(data.collision[i].indirect?"true":"false")<<'}';}
+        matches<<']';
+        std::printf("[FO2 WATER SEMANTIC] tick=%llu settings=%08x readable=%d WaterPlane=%u material=%08x shader=%u physics=%08x readable=%d collision-candidates=%s\n",
+            (unsigned long long)ticks,data.settings,int(data.settingsReadable),unsigned(data.waterPlane),data.material,data.shader,
+            data.physics,int(data.physicsReadable),matches.str().c_str());
+        if(const char* session=std::getenv("FO2_METAL_SESSION_DIR")){if(*session){
+            auto path=std::filesystem::path(session)/"water-semantics.jsonl";std::ofstream file(path,std::ios::app);
+            file.exceptions(std::ios::failbit|std::ios::badbit);
+            file<<"{\"physics_tick\":"<<ticks<<",\"settings_pointer\":"<<data.settings<<",\"settings_readable\":"<<(data.settingsReadable?"true":"false")
+                <<",\"water_plane\":"<<unsigned(data.waterPlane)<<",\"material_pointer\":"<<data.material<<",\"shader_id\":"<<data.shader
+                <<",\"physics_pointer\":"<<data.physics<<",\"physics_readable\":"<<(data.physicsReadable?"true":"false")
+                <<",\"pointer_probes\":"<<data.pointerProbes<<",\"probe_limit\":"<<(data.probeLimit?"true":"false")<<",\"collision_candidates\":"<<matches.str()<<",\"render_association_verified\":false}\n";
+        }}
+    }catch(const std::exception& e){disabled=true;physicalWaterAsset.store(0,std::memory_order_release);std::fprintf(stderr,"[FO2 WATER SEMANTIC] Diagnostic disabled: %s\n",e.what());}
+}
 extern "C" void recomp_hook(uint32_t va){
     if(va==0x0056C850u){
+        fo2WaterSemanticTrace();
         lastRacePhysics.store(std::chrono::steady_clock::now().time_since_epoch().count(),std::memory_order_relaxed);physicsSteps.fetch_add(1,std::memory_order_relaxed);
         // FO2_PHYSICS_HALF=1: the game runs a tick every 10 ms and steps its physics world in each. The world step takes
         // its time step as an argument ([esp+8], 0.01) and its forces are computed inside it: here it runs one tick in
@@ -1504,12 +1680,13 @@ extern "C" void recomp_hook(uint32_t va){
     }
     else if(va==0x0041A7F0u)fo2EngineSoundGuard();
     else if(va==0x004C8320u)fo2_video_close(g_esi);   // the player (esi) closes its streams
-    else if(va==0x00524276u)fo2CameraScriptRead();
+    else if(va==0x00524276u){fo2CameraScriptRead();fo2TestLevelRead();}
     // 0x4C8F00 (player*, file name, flags): the Zoom release's logo takes the place of the first boot movie.
     else if(va==0x004C8F00u){
         static const bool skip=[]{const char* e=std::getenv("FO2_SKIP_LOGO");return !e||e[0]!='0';}();
-        const uint32_t name=read32(g_esp+8);
-        if(skip&&name&&std::memcmp(ptr(name,22),"data/video/nvidia.avi",22)==0){g_eax=0;g_recomp_skip_function=1;}
+        static const bool intro=[]{const char* e=std::getenv("FO2_SKIP_INTRO");return e&&e[0]=='1';}();
+        const uint32_t name=read32(g_esp+8);const std::string movie=name?guestString(name):"";
+        if(fo2_video_skip_startup(movie.c_str(),skip,intro)){NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"FO2 VIDEO","Skipping startup movie: %s",movie.c_str());g_eax=0;g_recomp_skip_function=1;}
     }
     // 0x5B06A0 rejects any adapter mode narrower than 512 or lower than 384. The mode EnumAdapterModes just wrote to
     // [esp+0x1C] / [esp+0x20] is raised for the two compares and restored right after them (RG351P: 480x320).
@@ -1711,6 +1888,11 @@ static void nfsCrashHandler(int sig,siginfo_t* info,void* context){
     signal(sig,SIG_DFL);raise(sig);
 }
 extern "C" void nfsInstallCrashHandler(){
+#ifdef FO2_ADDRESS_SANITIZER
+    // Preserve the sanitizer's handlers and alternate signal stack, on every
+    // native thread. Its report identifies the original invalid host access.
+    return;
+#endif
     #ifdef __APPLE__
     alignas(16) static thread_local unsigned char alternateStack[64u<<10];
     stack_t stack{};stack.ss_sp=alternateStack;stack.ss_size=sizeof alternateStack;

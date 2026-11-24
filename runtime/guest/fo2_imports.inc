@@ -170,6 +170,7 @@ int receive(const net::Socket& socket,const Buffers& buffers,uint32_t flags,uint
         done+=part;
     }
     bytes=uint32_t(done);
+    net::traceDatagram(socket,false,message.data(),size_t(got),peer);
     noteReceived(peer,size_t(got));
     if(from&&fromLength)net::storeAddress(from,fromLength,peer,std::min<socklen_t>(peerLength,16));
     if(flags)write32(flags,0);
@@ -206,6 +207,7 @@ void wsaSendTo(){   // (socket, WSABUF*, count, sent*, flags, to, toLength, over
     static int shown=0;if(shown<40&&addressLength){++shown;std::printf("[FO2 NET] send %zu bytes to %s\n",message.size(),net::describe(address).c_str());}
     const ssize_t sent=::sendto(socket->fd,message.data(),message.size(),MSG_DONTWAIT|MSG_NOSIGNAL,addressLength?reinterpret_cast<sockaddr*>(&address):nullptr,addressLength);
     if(sent<0){++wsaov::sendErrors;wsaov::report();ret(net::failErrno(),9);return;}
+    if(addressLength)net::traceDatagram(*socket,true,message.data(),size_t(sent),address);
     ++wsaov::sentPackets;wsaov::sentBytes+=uint64_t(sent);wsaov::report();
     if(arg(3))write32(arg(3),uint32_t(sent));
     wsaov::complete(arg(7),uint32_t(sent),0);

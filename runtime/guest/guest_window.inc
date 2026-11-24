@@ -1,5 +1,5 @@
 struct GuestWindowClass {uint32_t atom,procedure,instance,style,extra;std::string name;};
-struct GuestWindow {uint32_t procedure,instance,style,exstyle,parent,user=0,id=0,extra;int32_t x,y,width,height;bool visible;std::map<uint32_t,uint32_t> data;};
+struct GuestWindow {uint32_t procedure,instance,style,exstyle,parent,user=0,id=0,extra;int32_t x,y,width,height;bool visible;std::map<uint32_t,uint32_t> data;uint32_t ownerThread=guestThreadId;bool destroying=false;};
 std::map<std::string,GuestWindowClass> windowClasses;
 std::map<uint32_t,GuestWindow> windows;
 uint32_t nextClassAtom=1,nextWindow=0xf0000301;
@@ -30,14 +30,19 @@ void createWindowEx(){
     uint32_t handle=nextWindow++,structure=allocate(48),parameters[12]={arg(11),arg(10),arg(9),arg(8),static_cast<uint32_t>(height),static_cast<uint32_t>(width),static_cast<uint32_t>(y),static_cast<uint32_t>(x),arg(3),arg(2),arg(1),arg(0)};
     windows.emplace(handle,GuestWindow{cls->procedure,arg(10),arg(3),arg(0),arg(8),0,arg(9),cls->extra,x,y,width,height,(arg(3)&0x10000000)!=0,{}});
     std::memcpy(ptr(structure,48),parameters,48);
-    if(!windowMessage(handle,0x81,0,structure)||windowMessage(handle,1,0,structure)==UINT32_MAX){
+    if(!windowMessage(handle,0x81,0,structure)||!windows.count(handle)||
+       windowMessage(handle,1,0,structure)==UINT32_MAX||!windows.count(handle)){
         windows.erase(handle);heaps->free(GuestHeaps::process,structure);lastError=1407;ret(0,12);return;
     }
     heaps->free(GuestHeaps::process,structure);
     NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Guest window %08x class=%s size=%dx%d proc=%08x",handle,cls->name.c_str(),width,height,cls->procedure);
     ret(handle,12);
 }
-void defaultWindowProc(){ret(arg(1)==0x81||arg(1)==0x14?1:0,4);}
+bool destroyGuestWindow(uint32_t handle);
+void defaultWindowProc(){
+    if(arg(1)==0x10){destroyGuestWindow(arg(0));ret(0,4);return;} // WM_CLOSE
+    ret(arg(1)==0x81||arg(1)==0x14?1:0,4);
+}
 void windowLong(bool set){
     auto window=windows.find(arg(0));if(window==windows.end()){lastError=1400;ret(0,set?3:2);return;}
     auto& value=window->second;int32_t index=arg(1);uint32_t* field=nullptr;
@@ -68,11 +73,15 @@ void setWindowPos(){
     uint32_t handle=arg(0),flags=arg(6);auto window=windows.find(handle);if(window==windows.end()){lastError=1400;ret(0,7);return;}
     uint32_t structure=allocate(28),values[7]={handle,arg(1),arg(2),arg(3),arg(4),arg(5),flags};std::memcpy(ptr(structure,28),values,28);
     if(!(flags&0x400))windowMessage(handle,0x46,0,structure);
-    std::memcpy(values,ptr(structure,28),28);flags=values[6];auto& value=windows.at(handle);
+    std::memcpy(values,ptr(structure,28),28);flags=values[6];
+    window=windows.find(handle);
+    if(window==windows.end()){heaps->free(GuestHeaps::process,structure);lastError=1400;ret(0,7);return;}
+    auto& value=window->second;
     if(!(flags&2)){value.x=values[2];value.y=values[3];}if(!(flags&1)){value.width=values[4];value.height=values[5];}
     if(flags&0x40)value.visible=true;if(flags&0x80)value.visible=false;
+    const uint32_t packedSize=(uint32_t(value.height)<<16)|(uint32_t(value.width)&0xffff);
     windowMessage(handle,0x47,0,structure);
-    if(!(flags&1))windowMessage(handle,5,0,(uint32_t(value.height)<<16)|(uint32_t(value.width)&0xffff));
+    if(!(flags&1)&&windows.count(handle))windowMessage(handle,5,0,packedSize);
     heaps->free(GuestHeaps::process,structure);ret(1,7);
 }
 void updateWindow(){if(!windows.count(arg(0))){lastError=1400;ret(0,1);return;}windowMessage(arg(0),0xf,0,0);ret(1,1);}
@@ -125,6 +134,37 @@ void enqueueGuestText(const std::vector<uint32_t>& characters){
 std::atomic<float> guestPointerX{0.5f},guestPointerY{0.5f};
 constexpr uint32_t pointerPending=0xffffffffu;  // lParam placeholder of queued mouse messages
 uint32_t captureWindow{};
+bool destroyGuestWindow(uint32_t handle){
+    auto found=windows.find(handle);
+    if(found==windows.end()){lastError=1400;return false;}
+    if(found->second.ownerThread!=guestThreadId){lastError=5;return false;}
+    if(found->second.destroying)return true; // callbacks may reenter DestroyWindow
+    found->second.destroying=true;
+    const uint32_t parent=found->second.parent,id=found->second.id,
+        style=found->second.style,exstyle=found->second.exstyle;
+    found->second.visible=false;
+    // Never retain a map iterator/reference across a guest callback.
+    if((style&0x40000000u)&&!(exstyle&4)&&windows.count(parent))
+        windowMessage(parent,0x210,(id<<16)|2,handle); // WM_PARENTNOTIFY/WM_DESTROY
+    if(activeWindow==handle){
+        activeWindow=0;windowMessage(handle,8,0,0);windowMessage(handle,6,0,0);
+    }
+    if(captureWindow==handle){captureWindow=0;windowMessage(handle,0x215,0,0);}
+    windowMessage(handle,2,0,0); // parent observes its children during WM_DESTROY
+    std::vector<uint32_t> children;
+    for(const auto& entry:windows)if(entry.first!=handle&&entry.second.parent==handle)
+        children.push_back(entry.first);
+    for(uint32_t child:children)if(windows.count(child))destroyGuestWindow(child);
+    windowMessage(handle,0x82,0,0); // WM_NCDESTROY follows the children's destruction
+    for(auto it=paintContexts.begin();it!=paintContexts.end();)
+        if(it->second==handle)it=paintContexts.erase(it);else ++it;
+    {std::lock_guard<std::mutex> lock(messageMutex);
+        windowMessages.erase(std::remove_if(windowMessages.begin(),windowMessages.end(),
+            [&](const GuestMessage& message){return message.hwnd==handle;}),windowMessages.end());}
+    windows.erase(handle);
+    return true;
+}
+void destroyWindow(){ret(destroyGuestWindow(arg(0)),1);}
 std::atomic<uint32_t> pointerButtons{0};       // MK_LBUTTON 1, MK_RBUTTON 2: wParam of the mouse messages
 std::pair<int32_t,int32_t> pointerInWindow(){
     auto window=windows.find(activeWindow);

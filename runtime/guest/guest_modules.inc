@@ -145,9 +145,18 @@ void testLiftedD3DXCompiler(){
     const uint32_t outputs=allocate(16);
     auto bufferPointer=[](uint32_t buffer){return callGuest(read32(read32(buffer)+12),{buffer});};
     auto release=[](uint32_t buffer){if(buffer)callGuest(read32(read32(buffer)+8),{buffer});};
-    for(const auto& test:std::vector<std::pair<const char*,const char*>>{
+    std::vector<std::pair<const char*,const char*>> cases{
         {"vs_2_0","float4 main(float4 p : POSITION) : POSITION { return p; }"},
-        {"ps_2_0","float4 main() : COLOR0 { return float4(1,0.25,0.5,1); }"}}){
+        {"ps_2_0","float4 main() : COLOR0 { return float4(1,0.25,0.5,1); }"}};
+    if(std::getenv("FO2_SHADER_CAPTURE")){
+        cases.push_back({"vs_2_0","float4x4 world : register(c0); struct O {float4 p:POSITION;float2 uv:TEXCOORD0;float4 c:COLOR0;}; O main(float4 p:POSITION,float2 uv:TEXCOORD0,float4 c:COLOR0){O o;o.p=mul(p,world);o.uv=uv;o.c=c;return o;}"});
+        cases.push_back({"vs_2_0","float4 values[32]:register(c0);float4 main(float4 p:POSITION,float4 index:BLENDINDICES):POSITION{return p+values[(int)index.x];}"});
+        cases.push_back({"ps_2_0","sampler2D image:register(s0);float4 tint:register(c3);float4 main(float2 uv:TEXCOORD0,float4 color:COLOR0):COLOR0{return tex2D(image,uv)*color*tint;}"});
+        cases.push_back({"ps_2_0","samplerCUBE sky:register(s0);float4 main(float3 v:TEXCOORD0):COLOR0{return texCUBE(sky,v);}"});
+        cases.push_back({"ps_2_0","sampler2D image:register(s0);float4 main(float2 uv:TEXCOORD0):COLOR0{float4 c=tex2D(image,uv);clip(c.a-0.25);return c;}"});
+        cases.push_back({"ps_2_0","float4 tint:register(c5);float4 fog:register(c8);float4 main(float4 color:COLOR0,float f:TEXCOORD0):COLOR0{return lerp(tint*color,fog,saturate(f));}"});
+    }
+    for(const auto& test:cases){
         uint32_t source=fo2::guestDup(test.second),profile=fo2::guestDup(test.first),entryName=fo2::guestDup("main");
         for(unsigned i=0;i<12;i+=4)write32(outputs+i,0);
         write32(outputs+12,0xfeedc0de);
@@ -161,6 +170,7 @@ void testLiftedD3DXCompiler(){
         const uint32_t expected=test.first[0]=='v'?0xfffe0200u:0xffff0200u;
         if(bytes<8||version!=expected||read32(outputs+12)!=0xfeedc0de)
             throw GuestStop("D3DX shader buffer or output guard failed");
+        fo2render::captureShader(ptr(bufferPointer(shader),bytes),bytes);
         release(shader);release(errors);release(constants);
         for(uint32_t allocation:{source,profile,entryName})heaps->free(GuestHeaps::process,allocation);
     }

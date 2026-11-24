@@ -1,8 +1,11 @@
 #include "../host/macos_compat.h"
 #include <SDL2/SDL.h>
+#ifndef FO2_METAL
 #include <SDL2/SDL_opengles2.h>
+#endif
 
 #include <cstdio>
+#include <unistd.h>
 #ifdef __APPLE__
 static constexpr void (*fo2GcovDump)(void) = nullptr;
 static constexpr int (*fo2ProfileWrite)(void) = nullptr;
@@ -21,11 +24,25 @@ extern "C" int __llvm_profile_write_file(void) FO2_WEAK_IMPORT;  // clang profil
 #include <filesystem>
 #include <algorithm>
 #include <atomic>
+#include <fstream>
+#include "test_scenario.h"
 
 #include "guest_runtime.h"
 #include "guest_memory.h"
 #include "d3d9_bridge.h"
+#ifdef FO2_METAL
+#include "../render/commands.h"
+extern "C" uint32_t getD3D9PresentCount();
+extern void fo2MetalDestroyWindow();
+extern void fo2MetalSetRaceActive(bool);
+extern bool fo2MetalDebugReady();
+extern bool fo2MetalWaterReady();
+extern bool fo2TestLevelInjected();
+extern void fo2MetalToggleSSR();
+extern void fo2MetalToggleWaterTrace();
+#else
 #include "d3d9_gles.h"
+#endif
 #include "guest_boot_worker.h"
 #include "nfs_widescreen.h"
 #include "runtime_log.h"
@@ -415,10 +432,28 @@ static void chooseResolution(R36SHostConfig& config) {
 }
 
 extern "C" void nfsInstallCrashHandler();   // guest_runtime.cpp
+#ifdef FO2_METAL
+extern int fo2CheckMetalMemoryCPU();
+#endif
 int main(int argc, char** argv) {
+#ifdef FO2_METAL
+    try {
+        if(argc>1 && std::strcmp(argv[1],"--metal-check-raytracing-water")==0)return fo2render::checkMetalWaterTrace();
+        if(argc>1 && std::strcmp(argv[1],"--metal-check-raytracing")==0)return fo2render::checkMetalRayTracing();
+        if(argc>1 && std::strcmp(argv[1],"--metal-check-raytracing-cpu")==0)return fo2render::checkMetalRayTracing(false);
+        if(argc>1 && std::strcmp(argv[1],"--metal-check-raytracing-scene")==0)return fo2render::checkMetalRayTracingScene(argc>2?argv[2]:nullptr);
+        if(argc>1 && std::strcmp(argv[1],"--metal-check-raytracing-scene-cpu")==0)return fo2render::checkMetalRayTracingScene(argc>2?argv[2]:nullptr,false);
+        if(argc>1 && std::strcmp(argv[1],"--metal-replay-raytracing")==0)return fo2render::replayTraceMismatch(argc>2?argv[2]:nullptr);
+        if(argc>1 && std::strcmp(argv[1],"--metal-check-memory")==0)return fo2CheckMetalMemoryCPU();
+        if(argc>1 && std::strcmp(argv[1],"--metal-check")==0)return fo2render::checkMetalRenderer();
+        if(argc>1 && std::strcmp(argv[1],"--metal-check-shaders")==0)return fo2render::checkMetalShaders(argc>2?argv[2]:nullptr,false);
+        if(argc>1 && std::strcmp(argv[1],"--metal-compile-shaders")==0)return fo2render::checkMetalShaders(argc>2?argv[2]:nullptr,true);
+    }catch(const std::exception& e){std::fprintf(stderr,"[Metal check] %s\n",e.what());return 1;}
+#endif
     // Line-buffered logs: the launcher pipes them to log.txt, and a hang must not swallow the last lines.
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     std::setvbuf(stderr, nullptr, _IOLBF, 0);
+    std::printf("[FO2 HOST] pid=%d; startup timing trace=%s\n",int(getpid()),std::getenv("FO2_STARTUP_TRACE")?std::getenv("FO2_STARTUP_TRACE"):"0");
     R36SHostConfig config;
     config.gameDir = findGamePath(argc, argv);
     if (const char* envLang = std::getenv("NFSU2_LANG")) {
@@ -434,6 +469,47 @@ int main(int argc, char** argv) {
         else if (arg == "--auto-advance") config.autoAdvance = true;
         else if (arg.rfind("--lang=", 0) == 0) config.language = arg.substr(7);
     }
+
+    const std::string scenarioName = std::getenv("FO2_TEST_SCENARIO") ? std::getenv("FO2_TEST_SCENARIO") : "manual";
+    if(scenarioName!="manual"&&scenarioName!="auto-race"){
+        std::fprintf(stderr,"Unknown test scenario: %s\n",scenarioName.c_str());return 2;
+    }
+#ifdef FO2_METAL
+    try { fo2render::parseDebugView(std::getenv("FO2_DEBUG_VIEW")); }
+    catch(const std::exception& e){std::fprintf(stderr,"%s\n",e.what());return 2;}
+#endif
+    const std::string testLevel=std::getenv("FO2_TEST_LEVEL")?std::getenv("FO2_TEST_LEVEL"):"";
+    if(!testLevel.empty()&&(testLevel!="water-canal"||scenarioName!="auto-race")){
+        std::fprintf(stderr,"Water test level requires the isolated auto-race scenario\n");return 2;
+    }
+    if(!testLevel.empty()){
+#ifdef FO2_METAL
+        auto view=fo2render::parseDebugView(std::getenv("FO2_DEBUG_VIEW"));
+        if((view!=fo2render::DebugView::SSR&&view!=fo2render::DebugView::SSRMask)||
+            (std::getenv("FO2_SSR_MATERIALS")&&std::string(std::getenv("FO2_SSR_MATERIALS"))=="0")){
+            std::fprintf(stderr,"Water test level requires SSR material capture\n");return 2;
+        }
+#else
+        std::fprintf(stderr,"Water test level requires the Metal renderer\n");return 2;
+#endif
+        const char* session=std::getenv("FO2_METAL_SESSION_DIR");
+        if(!session||std::filesystem::weakly_canonical(std::filesystem::path(session)/"gamedata")!=std::filesystem::weakly_canonical(config.gameDir)){
+            std::fprintf(stderr,"Water test level may only run with a per-session copy of gamedata\n");return 2;
+        }
+    }
+    fo2test::RaceScenario autoScenario(scenarioName=="auto-race");
+    if(autoScenario.enabled())config.autoAdvance=false;
+    int scenarioExitCode=0;
+    auto writeScenario=[&](const char* state,uint32_t frame,double elapsed){
+        std::printf("[FO2 SCENARIO] %s frame=%u elapsed=%.2f steps=%u\n",state,frame,elapsed,autoScenario.step());
+        if(const char* path=std::getenv("FO2_SCENARIO_STATUS")){
+            std::ofstream file(path);
+            file << "{\"state\":\"" << state << "\",\"frame\":" << frame
+                 << ",\"elapsed\":" << elapsed << ",\"steps\":" << autoScenario.step()
+                 << ",\"test_level\":\"" << (testLevel.empty()?"default":testLevel) << "\",\"water_ready\":"
+                 << (testLevel=="water-canal"&&std::strcmp(state,"ready")==0?"true":"false") << "}\n";
+        }
+    };
 
     std::signal(SIGTERM, signalHandler);
     std::signal(SIGINT, signalHandler);
@@ -506,6 +582,9 @@ int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     setvbuf(stderr, nullptr, _IONBF, 0);
 
+#ifdef FO2_METAL
+    Uint32 windowFlags=SDL_WINDOW_METAL|SDL_WINDOW_ALLOW_HIGHDPI|SDL_WINDOW_SHOWN;
+#else
     // Create SDL2 window with OpenGL ES 2.0 support
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
@@ -524,6 +603,7 @@ int main(int argc, char** argv) {
     // Never use SDL_WINDOW_FULLSCREEN_DESKTOP as it triggers DRM CRTC mode re-probing which blanks the screen.
     Uint32 windowFlags = SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN;
 
+#endif
     g_window = SDL_CreateWindow(
         "FlatOut 2",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
@@ -531,6 +611,7 @@ int main(int argc, char** argv) {
         windowFlags
     );
 
+#ifndef FO2_METAL
     if (!g_window) {
         std::fprintf(stderr, "SDL window with an alpha channel failed (%s); retrying without\n", SDL_GetError());
         SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 0);
@@ -541,6 +622,7 @@ int main(int argc, char** argv) {
             windowFlags
         );
     }
+#endif
     if (!g_window) {
         std::fprintf(stderr, "Failed to create SDL window: %s\n", SDL_GetError());
         SDL_Quit();
@@ -574,6 +656,9 @@ int main(int argc, char** argv) {
         std::printf("[NFSU2] Guest memory 4GB virtual space initialized.\n");
     } catch (const std::exception& ex) {
         std::fprintf(stderr, "[NFSU2] Guest memory initialization error: %s\n", ex.what());
+#ifdef FO2_METAL
+        fo2MetalDestroyWindow();
+#endif
         SDL_DestroyWindow(g_window);
         SDL_Quit();
         return 1;
@@ -600,19 +685,45 @@ int main(int argc, char** argv) {
     auto lastFrameTime = std::chrono::steady_clock::now();
 
 
+    const auto scenarioStarted=std::chrono::steady_clock::now();
+    if(autoScenario.enabled())std::puts("[FO2 SCENARIO] auto-race: waiting for frontend; F9 cancels automatic input");
     uint32_t autoTick = 0;
     while (g_running) {
         if (g_guestWorker.isFinished()) {
             std::printf("[NFSU2] Guest runtime terminated (%s). Exiting main loop.\n", g_guestWorker.status().c_str());
+            if(autoScenario.enabled()&&autoScenario.state()!=fo2test::ScenarioState::Ready){
+                writeScenario("failed",getD3D9PresentCount(),std::chrono::duration<double>(std::chrono::steady_clock::now()-scenarioStarted).count());
+                scenarioExitCode=2;
+            }
             g_running = false;
             break;
         }
         auto frameStart = std::chrono::steady_clock::now();
 
+        if(autoScenario.enabled()){
+            const double seconds=std::chrono::duration<double>(frameStart-scenarioStarted).count();
+            bool viewReady=true;
+#ifdef FO2_METAL
+            viewReady=fo2render::parseDebugView(std::getenv("FO2_DEBUG_VIEW"))==fo2render::DebugView::Off||fo2MetalDebugReady();
+            if(testLevel=="water-canal")viewReady=viewReady&&fo2TestLevelInjected()&&fo2MetalWaterReady();
+#endif
+            auto update=autoScenario.tick(seconds,getD3D9PresentCount(),fo2InRace(),viewReady);
+            auto button=[](int action){return action==1?SDL_CONTROLLER_BUTTON_DPAD_RIGHT:SDL_CONTROLLER_BUTTON_A;};
+            if(update.release>=0){g_gamepad.button(button(update.release),false,fo2InRace(),padSetKey);publishGamepad();}
+            if(update.press>=0){
+                g_gamepad.button(button(update.press),true,false,padSetKey);publishGamepad();
+                std::printf("[FO2 SCENARIO] step %u/8: %s\n",autoScenario.step(),update.press==1?"right":"confirm");
+            }
+            if(update.capture)requestD3D9Screenshot();
+            if(update.ready)writeScenario("ready",getD3D9PresentCount(),seconds);
+            if(update.cancelled){writeScenario("cancelled",getD3D9PresentCount(),seconds);scenarioExitCode=2;}
+            if(update.failed){writeScenario("failed",getD3D9PresentCount(),seconds);scenarioExitCode=2;g_running=false;break;}
+        }
+
         // NFSU2_KEY_SCRIPT="start;frame:key[:frames],..." (smoke tests): from frame `start` on, the automatic menu
         // navigation stops and only these key taps reach the game (key: enter esc up down left right space tab,
         // or a hex DIK scan code; held for `frames`, default 4).
-        static const char* keyScript = std::getenv("NFSU2_KEY_SCRIPT");
+        static const char* keyScript = autoScenario.enabled()?nullptr:std::getenv("NFSU2_KEY_SCRIPT");
         static uint32_t keyScriptStart = keyScript ? static_cast<uint32_t>(std::atoi(keyScript)) : 0;
         if (keyScript && getD3D9PresentCount() >= keyScriptStart) {
             struct Tap { uint32_t frame, scan, len; };
@@ -865,6 +976,11 @@ int main(int argc, char** argv) {
                     if (scan) {
                         setGuestKey(scan, down);
                     }
+#ifdef FO2_METAL
+                    if(event.key.keysym.sym==SDLK_F7 && down && !event.key.repeat)fo2MetalToggleWaterTrace();
+                    if(event.key.keysym.sym==SDLK_F8 && down && !event.key.repeat && fo2render::parseDebugView(std::getenv("FO2_DEBUG_VIEW"))==fo2render::DebugView::SSR){fo2MetalToggleSSR();const char* capture=std::getenv("FO2_SSR_CAPTURE");if(!capture||std::strcmp(capture,"0"))requestD3D9Screenshot();}
+#endif
+                    if (event.key.keysym.sym == SDLK_F9 && down && autoScenario.enabled())autoScenario.cancel();
                     if (event.key.keysym.sym == SDLK_F10 && down) {
                         g_running = false;
                     }
@@ -876,7 +992,7 @@ int main(int argc, char** argv) {
         // FO2_AUTOPRESS="start,a" (testing without hands on the pad): from 15 s on, every 4 s, holds the
         // next listed pad button for 300 ms (3.9 s in a race, so "a" keeps the throttle down).
         {
-            static const char* autoList = std::getenv("FO2_AUTOPRESS");
+            static const char* autoList = autoScenario.enabled()?nullptr:std::getenv("FO2_AUTOPRESS");
             static const auto t0 = std::chrono::steady_clock::now();
             static int lastSlot = -1;
             if (autoList) {
@@ -948,6 +1064,10 @@ int main(int argc, char** argv) {
         const bool modeChanged = g_gamepad.refresh(fo2InRace(), padSetKey);
         if (g_gamepad.tickDpad() || modeChanged) publishGamepad();
 
+#ifdef FO2_METAL
+        fo2MetalSetRaceActive(fo2InRace());
+#endif
+
         // Check if D3D9 backend requested surface
         if (d3d9RequestsSurface()) {
             acknowledgeD3D9Surface(true);
@@ -957,6 +1077,10 @@ int main(int argc, char** argv) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 
+    if(autoScenario.enabled()&&autoScenario.state()!=fo2test::ScenarioState::Ready&&scenarioExitCode==0){
+        writeScenario("cancelled",getD3D9PresentCount(),std::chrono::duration<double>(std::chrono::steady_clock::now()-scenarioStarted).count());
+        scenarioExitCode=2;
+    }
     std::printf("[NFSU2] Shutting down...\n");
     quiesceGuestFilesForExit(3000);
     // Saves are closed and the card is synced. Tearing down the guest threads, the render thread and the
@@ -964,7 +1088,7 @@ int main(int argc, char** argv) {
     // is left to write, so end the process now: the kernel releases the display, audio and files.
     if (!std::getenv("NFSU2_FULL_SHUTDOWN")) {
         std::printf("[NFSU2] Clean exit.\n");
-        std::_Exit(0);
+        std::_Exit(scenarioExitCode);
     }
     requestGuestRuntimeStop();
     shutdownD3D9Bridge();
@@ -973,11 +1097,14 @@ int main(int argc, char** argv) {
         SDL_GameControllerClose(controller);
     }
     if (g_window) {
+#ifdef FO2_METAL
+        fo2MetalDestroyWindow();
+#endif
         SDL_DestroyWindow(g_window);
     }
     SDL_Quit();
 
     std::printf("[NFSU2] Clean exit.\n");
     ::sync();
-    std::_Exit(0);
+    std::_Exit(scenarioExitCode);
 }

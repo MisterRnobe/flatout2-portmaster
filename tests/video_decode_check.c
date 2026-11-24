@@ -1,6 +1,7 @@
 /* Run the production VP3 decoder and guest frame queue without SDL or a GPU. */
 #include "recomp_types.h"
 #include <stdio.h>
+#include "../runtime/native/fo2_video_options.h"
 uint32_t g_eax,g_esp;
 ptrdiff_t g_mem_base;
 extern int fo2_video_available(void);
@@ -8,6 +9,7 @@ extern void fo2_video_decode_frame(void);
 extern void fo2_video_close(uint32_t player);
 static uint32_t readWord(FILE* f){uint32_t v;if(fread(&v,4,1,f)!=1)exit(3);return v;}
 int main(int argc,char**argv){
+    if(!fo2_video_skip_startup("data/video/nvidia.avi",1,0)||!fo2_video_skip_startup("DATA\\VIDEO\\INTROINL.AVI",0,1)||fo2_video_skip_startup("data/video/bg_main.avi",1,1)||fo2_video_skip_startup("data/video/introinl.avi",1,0)||fo2_video_skip_startup("data/video/nvidia.avi",0,1))return 7;
     if(argc!=2)return 3;
     FILE* f=fopen(argv[1],"rb");if(!f)return 3;
     unsigned w=readWord(f),h=readWord(f),tag=readWord(f),frames=readWord(f);

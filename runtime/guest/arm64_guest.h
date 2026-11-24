@@ -3,6 +3,26 @@
 #include <time.h>
 #define RECOMP_GENERATED_CODE
 #include "recomp_types.h"
+// Only the three relevant generated translation units enable this observer.
+// Constants eliminate the test at every unrelated entry; full register/x87
+// synchronization surrounds the callback just as at ordinary lifted hooks.
+#ifdef FO2_RT_SCENE_OBSERVER
+extern int fo2_rt_scene_enabled;
+extern void fo2_rt_scene_enter(uint32_t);
+extern void fo2_rt_scene_leave(uint32_t);
+static inline void nfs_rt_scope_leave(uint32_t* va){if(*va)fo2_rt_scene_leave(*va);}
+#define NFS_RT_SCOPE(va) uint32_t _fo2_rt_scope __attribute__((cleanup(nfs_rt_scope_leave))) = \
+    ((va)==0x00553CA0u&&fo2_rt_scene_enabled)?(va):0;
+#define NFS_RT_ENTER(va) do { \
+    if (((va)==0x004C9DC0u||(va)==0x004C9B80u|| \
+         (va)==0x00553CA0u||(va)==0x005A6F20u||(va)==0x005A6EF0u) && fo2_rt_scene_enabled) { \
+        RECOMP_REGS_OUT(); fo2_rt_scene_enter(va); RECOMP_REGS_IN(); \
+    } \
+} while(0)
+#else
+#define NFS_RT_ENTER(va) ((void)0)
+#define NFS_RT_SCOPE(va)
+#endif
 // Fixed guest base: the 4 GB guest space is reserved at this host address (guest_memory.h), so a guest
 // access is base-constant + VA. With the base in a global (g_mem_base), the compiler had to reload it after
 // every guest store (a store through a uint8_t* may alias any global): one extra dependent load per access,
@@ -26,8 +46,8 @@ extern unsigned long long g_nfs_call_count;
 #define NFS_SET_CUR_FUNC(va) ((void)0)
 #endif
 // NFSU2 hooked its GetRacingResolution (0x005BF2E0) here; in FlatOut2.exe that address is other code.
-#define RECOMP_ENTER(va) do { \
-    NFS_SET_CUR_FUNC(va); RECOMP_FLAGS_IN(); \
+#define RECOMP_ENTER(va) NFS_RT_SCOPE(va) do { \
+    NFS_SET_CUR_FUNC(va); RECOMP_FLAGS_IN(); NFS_RT_ENTER(va); \
 } while(0)
 static inline uint64_t nfs_guest_rdtsc(void) {
     struct timespec t;
@@ -257,11 +277,11 @@ static inline __attribute__((always_inline)) uint64_t nfs_dbits(double v) { uint
 #undef RECOMP_ENTER
 // l_lwk: caller entries the function may read or change (8), or 0 when the analysis proved it never goes below
 // its entry depth (most functions): then nothing is copied in at entry nor compared at calls and returns.
-#define RECOMP_ENTER(va) enum { l_lwon = NFS_LW_##va, l_lwk = NFS_LWK_##va }; NFS_LW_VA_DECL(va) \
+#define RECOMP_ENTER(va) NFS_RT_SCOPE(va) enum { l_lwon = NFS_LW_##va, l_lwk = NFS_LWK_##va }; NFS_LW_VA_DECL(va) \
     if (l_lwon) { l_g0 = l_fp_sp; l_fp_sp = NFS_LWB; \
         for (int _k = 0; _k < l_lwk; ++_k) { l_lw[NFS_LWB + _k] = l_lws[_k] = l_stw[l_g0 + _k]; l_lwi[NFS_LWB + _k] = l_lwis[_k] = l_sti[l_g0 + _k]; } } \
     do { \
-        NFS_SET_CUR_FUNC(va); RECOMP_FLAGS_IN(); \
+        NFS_SET_CUR_FUNC(va); RECOMP_FLAGS_IN(); NFS_RT_ENTER(va); \
     } while(0)
 // x87 part of REGS_OUT / REGS_IN
 #define NFS_LW_OUT() ({ if (l_lwon) { \

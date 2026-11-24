@@ -1,4 +1,5 @@
 #pragma once
+#include "../render/shader_capture.h"
 
 // D3D9 shader translation for the GLES 2.0 backend.
 //
@@ -343,6 +344,7 @@ public:
         m_type = shaderType;
         const uint8_t* b = reinterpret_cast<const uint8_t*>(pFunction);
         m_bytecode.assign(b, b + byteLength);
+        fo2render::captureShader(m_bytecode.data(),m_bytecode.size());
         m_version = pFunction[0];
         const ShaderVariant* v = getVariant(0);
         return v != nullptr;
