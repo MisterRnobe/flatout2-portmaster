@@ -36,8 +36,8 @@ extern bool fo2MetalRaceActive();
 extern bool fo2MetalSSREnabled();
 extern "C" uint32_t fo2WaterPhysicalAsset();
 extern "C" int fo2OffcameraRayOnlyDraw();
-static thread_local bool metalRayOnly=false;
-extern "C" int fo2MetalSetRayOnly(int value){int previous=metalRayOnly;metalRayOnly=value!=0;return previous;}
+static thread_local int metalRayOnly=0;
+extern "C" int fo2MetalSetRayOnly(int value){int previous=metalRayOnly;metalRayOnly=value>=0&&value<=2?value:0;return previous;}
 extern const char* fo2MetalWaterTraceLabel();
 extern void fo2MetalSetDebugReady(bool);
 namespace fo2metal {
@@ -2306,7 +2306,8 @@ Draw Device::prepare() {
     }
   }
   if(d.captureMaterial)d.physicalWaterAsset=fo2WaterPhysicalAsset();
-  d.rayOnly=metalRayOnly||fo2OffcameraRayOnlyDraw()!=0;
+  int rayOnly=metalRayOnly?metalRayOnly:fo2OffcameraRayOnlyDraw();
+  d.rayOnly=rayOnly!=0;d.rayOnlyDetached=rayOnly==2;
   return d;
 }
 static uint32_t vertexCount(D3DPRIMITIVETYPE t, UINT n) {

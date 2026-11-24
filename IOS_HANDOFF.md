@@ -46,6 +46,8 @@ The **latest** addition is a bounded ray-only population of car scene-root meshe
 
 The population hooks use five verified EXE entry addresses in three generated EXE translation units. `scripts/build_macos.py` marks those units with `FO2_RT_SCENE_OBSERVER=1`; preserve the equivalent build defines or intentionally disable the population feature on iOS. Preserve per-command ray-only provenance and scoped cleanup so hidden geometry cannot suppress the HUD or visible draws.
 
+Subsequent macOS work also includes independent loose/released part roots from the car's part inventory, with owner/parent validation and a distinct ray-only provenance value (2). This addition likewise awaits gameplay/GPU acceptance; do not collapse the source-kind value to a boolean when porting command transport. See the final section of `MACOS.md`. The prepared iOS branch starts at its published checkpoint; later shared refinements arrive by rebasing onto `macos-metal`.
+
 ## Useful baseline checks
 
 For a local macOS comparison, the private inputs allow a full rebuild without lifting again:

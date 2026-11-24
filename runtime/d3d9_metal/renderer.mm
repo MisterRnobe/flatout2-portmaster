@@ -215,6 +215,7 @@ struct Renderer::Impl {
   uint64_t currentWaterTraceFrame=0,rtInspectionFrame=0;
   unsigned rtAutoInspections=0;
   bool rayOnlyInspected=false;
+  bool detachedInspected=false;
   std::shared_ptr<Shader> inspectionReflectionPS;
   // Do not create native threads during guest startup/video initialization.
   // The first fully collected racing scene creates the worker lazily.
@@ -1313,6 +1314,7 @@ std::shared_ptr<Image> Renderer::screenReflections(const std::shared_ptr<Image>&
       ++impl->rtAutoInspections;impl->rtInspectionFrame=impl->frames;
       captureReflectionDiagnostics((std::filesystem::path(session)/"rt-water-inspect").string(),base);
       if(impl->waterTrace->rayOnlyMaterialHitCount()>=16)impl->rayOnlyInspected=true;
+      if(impl->waterTrace->detachedMaterialHitCount()>=16)impl->detachedInspected=true;
     }
   }
   if(rtWater&&impl->waterTrace&&!impl->rayOnlyInspected&&impl->waterTrace->rayOnlyMaterialHitCount()>=16&&
@@ -1320,6 +1322,14 @@ std::shared_ptr<Image> Renderer::screenReflections(const std::shared_ptr<Image>&
     const char* session=std::getenv("FO2_METAL_SESSION_DIR");if(session&&*session){
       impl->rayOnlyInspected=true;
       captureReflectionDiagnostics((std::filesystem::path(session)/"rt-ray-only-inspect").string(),base);
+      if(impl->waterTrace->detachedMaterialHitCount()>=16)impl->detachedInspected=true;
+    }
+  }
+  if(rtWater&&impl->waterTrace&&!impl->detachedInspected&&impl->waterTrace->detachedMaterialHitCount()>=16&&
+     (!captureRT||std::strcmp(captureRT,"0"))){
+    const char* session=std::getenv("FO2_METAL_SESSION_DIR");if(session&&*session){
+      impl->detachedInspected=true;
+      captureReflectionDiagnostics((std::filesystem::path(session)/"rt-detached-inspect").string(),base);
     }
   }
   return impl->debugOutput;
@@ -1447,6 +1457,7 @@ fragment float4 inspectionDepthPS(float4 p [[position]],depth2d<float,access::re
       @"opaque_fixed_specular_pixels":@(cues[2]),@"opaque_water_cue_pixels":@(cues[3]),@"opaque_terrain_specular_pixels":@(cues[4]),
       @"rt_same_frame_compared":@(rtCompared),@"rt_source_frame":@(impl->currentWaterTraceFrame),
       @"rt_ray_only_material_hits":@(rtCompared&&impl->waterTrace?impl->waterTrace->rayOnlyMaterialHitCount():0),
+      @"rt_detached_material_hits":@(rtCompared&&impl->waterTrace?impl->waterTrace->detachedMaterialHitCount():0),
       @"rt_vs_ssr_changed_pixels":@(rtChanged),@"rt_vs_ssr_changed_pixels_at_least_3_levels":@(rtSignificant),
       @"rt_vs_ssr_water_changed_pixels_at_least_3_levels":@(rtWaterSignificant),@"rt_vs_ssr_nonwater_changed_pixels":@(rtNonwaterChanged),@"rt_vs_ssr_max_channel_delta":@(rtMaxDelta),
       @"fresh_inspection_even_when_ssr_off":@YES,@"composite_compared":@(base!=nullptr),

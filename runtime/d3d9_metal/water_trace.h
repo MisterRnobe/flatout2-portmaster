@@ -66,8 +66,8 @@ class WaterTrace {
  id<MTLDevice> device;id<MTLCommandQueue> queue;id<MTLComputePipelineState> pipeline;
  id<MTLTexture> output;uint64_t completed=0;uint32_t lastWaterRays=0;bool fixture=false;double totalMs=0,maxMs=0;
  TraceCarShading carShading;bool carsEnabled=true;
- uint32_t lastMaterialHits=0,lastOffscreenMaterialHits=0,lastRayOnlyMaterialHits=0;
- uint64_t materialHitsTotal=0,offscreenHitsTotal=0,rayOnlyHitsTotal=0,rayOnlyFrames=0;
+ uint32_t lastMaterialHits=0,lastOffscreenMaterialHits=0,lastRayOnlyMaterialHits=0,lastDetachedHits=0;
+ uint64_t materialHitsTotal=0,offscreenHitsTotal=0,rayOnlyHitsTotal=0,rayOnlyFrames=0,detachedHitsTotal=0;
  id<MTLAccelerationStructure> build(MTLAccelerationStructureDescriptor* descriptor){@autoreleasepool{
    return buildTraceStructure(device,queue,descriptor);
  }}
@@ -76,6 +76,7 @@ public:
  uint32_t materialHitCount()const{return lastMaterialHits;}
  uint32_t offscreenMaterialHitCount()const{return lastOffscreenMaterialHits;}
  uint32_t rayOnlyMaterialHitCount()const{return lastRayOnlyMaterialHits;}
+ uint32_t detachedMaterialHitCount()const{return lastDetachedHits;}
  WaterTrace(id<MTLDevice> value,bool checking=false):device(value),fixture(checking),carShading(value){@autoreleasepool{
    traceRequire(device&&device.supportsRaytracing,"Water RT unavailable on this device");
    queue=[device newCommandQueue];traceRequire(queue!=nil,"Water RT queue allocation failed");
@@ -118,7 +119,7 @@ public:
    if(carsEnabled)try{cars=carShading.prepare(snapshot,texture,sampler);}catch(const std::exception& error){
      if(fixture)throw;carsEnabled=false;std::fprintf(stderr,"[FO2 RT CAR] Disabled material path: %s; screen-radiance RT retained\n",error.what());}
    size_t carBytes=0;for(auto& car:cars)carBytes+=car.range.vertices*(64+96);
-   size_t resident=vb+ib+hitBytes+carBytes+output.allocatedSize+sizeof(MTLAccelerationStructureInstanceDescriptor)+36;
+   size_t resident=vb+ib+hitBytes+carBytes+output.allocatedSize+sizeof(MTLAccelerationStructureInstanceDescriptor)+40;
    traceRequire(resident<limit&&ps.accelerationStructureSize<limit-resident&&
       ps.buildScratchBufferSize<limit-resident-ps.accelerationStructureSize,"Water RT BLAS memory budget exceeded");
    auto primitive=build(pd);
@@ -131,7 +132,7 @@ public:
    auto ts=[device accelerationStructureSizesWithDescriptor:td];resident+=ps.accelerationStructureSize;
    traceRequire(resident<limit&&ts.accelerationStructureSize<limit-resident&&ts.buildScratchBufferSize<limit-resident-ts.accelerationStructureSize,"Water RT TLAS memory budget exceeded");
    auto scene=build(td);
-   uint32_t zero[9]{};auto counters=[device newBufferWithBytes:zero length:sizeof zero options:MTLResourceStorageModeShared];
+   uint32_t zero[10]{};auto counters=[device newBufferWithBytes:zero length:sizeof zero options:MTLResourceStorageModeShared];
    auto hits=[device newBufferWithLength:hitBytes options:MTLResourceStorageModePrivate];
    traceRequire(counters&&hits,"Water RT hit/counter allocation failed");
    auto command=[queue commandBuffer];auto encoder=[command computeCommandEncoder];traceRequire(encoder!=nil,"Water RT encoder allocation failed");
@@ -147,6 +148,7 @@ public:
    traceRequire(counts[6]<=counts[5]&&counts[5]<=counts[1],"Water RT invalid material counters");
    traceRequire(counts[7]<=counts[6],"Water RT invalid offscreen material counter");lastMaterialHits=counts[5];lastOffscreenMaterialHits=counts[7];
    traceRequire(counts[8]<=counts[5],"Water RT invalid ray-only material counter");lastRayOnlyMaterialHits=counts[8];
+   traceRequire(counts[9]<=counts[8],"Water RT invalid detached material counter");lastDetachedHits=counts[9];detachedHitsTotal+=counts[9];
    materialHitsTotal+=counts[5];offscreenHitsTotal+=counts[7];rayOnlyHitsTotal+=counts[8];if(snapshot.rayOnlyDraws)++rayOnlyFrames;
    double elapsed=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();totalMs+=elapsed;maxMs=std::max(maxMs,elapsed);
    if(!fixture&&(completed==1||completed%300==0)){
@@ -159,6 +161,7 @@ public:
          @"ray_only_draws":@(snapshot.rayOnlyDraws),@"ray_only_material_hits":@(counts[8]),
          @"car_material_hits_total":@(materialHitsTotal),@"car_offscreen_hits_total":@(offscreenHitsTotal),
          @"ray_only_material_hits_total":@(rayOnlyHitsTotal),@"frames_with_ray_only_geometry":@(rayOnlyFrames),
+         @"detached_draws":@(snapshot.detachedDraws),@"detached_material_hits":@(counts[9]),@"detached_material_hits_total":@(detachedHitsTotal),
          @"width":@(w),@"height":@(h),@"water_rays":@(counts[0]),@"geometry_hits":@(counts[1]),@"offscreen_hits":@(counts[2]),
          @"hidden_radiance_hits":@(counts[3]),@"radiance_hits":@(counts[4]),@"prepare_build_trace_wait_ms":@(elapsed),@"mean_prepare_build_trace_wait_ms":@(totalMs/completed),@"max_prepare_build_trace_wait_ms":@(maxMs)};
        NSError* error=nil;auto data=[NSJSONSerialization dataWithJSONObject:report options:NSJSONWritingPrettyPrinted error:&error];
@@ -167,7 +170,7 @@ public:
    }
    if(completed==1||completed%300==0)std::printf("[FO2 RT WATER] frame=%llu same-frame, triangles=%zu, %lux%lu rays: water=%u hit=%u offscreen=%u hidden=%u radiance=%u; prepare/build/trace/wait %.3f ms (hybrid screen radiance)\n",
       (unsigned long long)displayFrame,s.indices.size()/3,(unsigned long)w,(unsigned long)h,counts[0],counts[1],counts[2],counts[3],counts[4],elapsed);
-   if(completed==1||completed%300==0)std::printf("[FO2 RT CAR] frame=%llu materials=%zu shaded=%u non-screen=%u offscreen=%u ray-only-draws=%u ray-only-hits=%u enabled=%d\n",(unsigned long long)displayFrame,cars.size(),counts[5],counts[6],counts[7],snapshot.rayOnlyDraws,counts[8],int(carsEnabled));
+   if(completed==1||completed%300==0)std::printf("[FO2 RT CAR] frame=%llu materials=%zu shaded=%u non-screen=%u offscreen=%u ray-only-draws=%u ray-only-hits=%u detached-draws=%u detached-hits=%u enabled=%d\n",(unsigned long long)displayFrame,cars.size(),counts[5],counts[6],counts[7],snapshot.rayOnlyDraws,counts[8],snapshot.detachedDraws,counts[9],int(carsEnabled));
    return output;
  }}
 };
@@ -233,6 +236,7 @@ int checkMetalWaterTrace(){@autoreleasepool{
  auto material=std::make_shared<TraceCarMaterial>();material->vs=carDraw.vs;material->ps=carDraw.ps;
  material->vsConstants=carDraw.vsConstants;material->psConstants=carDraw.psConstants;
  material->effects[62]=1;
+ material->effects[61]=1;
  for(auto p:snapshot.scene.positions)material->inputs.push_back({p[0],p[1],p[2],1,0,1,0,1,0,0,0,0,.5f,.5f,0,1});
  std::array<id<MTLTexture>,4> carTextures;std::array<id<MTLSamplerState>,4> carSamplers;
  auto sd=[MTLSamplerDescriptor new];sd.minFilter=sd.magFilter=MTLSamplerMinMagFilterNearest;
@@ -252,6 +256,7 @@ int checkMetalWaterTrace(){@autoreleasepool{
  unsigned blue=0;for(size_t i=0;i<shaded.size();i+=4)if(shaded[i+3]){++blue;traceRequire(shaded[i]==0&&shaded[i+1]==0&&shaded[i+2]==0x3c00,"RT car color came from screen instead of blue material");}
  traceRequire(blue>20&&trace.materialHitCount()==blue&&trace.offscreenMaterialHitCount()>0,"RT car offscreen material shading missing");
  traceRequire(trace.rayOnlyMaterialHitCount()==blue,"RT car lost ray-only hit provenance");
+ traceRequire(trace.detachedMaterialHitCount()==blue,"RT car lost detached-part hit provenance");
  ++material->textures[0]->version;empty(read(trace.render(snapshot,42,c,opaque,color,normals,water,resolve,sampler)));
  traceRequire(trace.materialHitCount()==0,"RT car reused a changed texture version");snapshot.cars.clear();
  for(auto& p:snapshot.scene.positions)p[2]=-100;empty(render()); // Out of finite ray range.

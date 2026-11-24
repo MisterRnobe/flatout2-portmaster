@@ -13,7 +13,9 @@ struct Fixture {
   void matrix(uint32_t a,float x=0){float m[16]={1,0,0,0,0,1,0,0,0,0,1,0,x,0,0,1};std::memcpy(bytes.data()+a,m,64);}
   void node(uint32_t a,uint32_t next=0,float x=10){put(a,0x67ae30);put(a+0xc8,next);put(a+0x108,1);matrix(a+0x80,x);}
   bool read(uint32_t a,void* out,size_t n){if(a>bytes.size()||n>bytes.size()-a)return false;std::memcpy(out,bytes.data()+a,n);return true;}
-  Selection select(){return fo2offcamera::select(context,camera,[&](uint32_t a,void* out,size_t n){return read(a,out,n);});}
+  Selection select(uint32_t buckets=0){return fo2offcamera::select(context,camera,[&](uint32_t a,void* out,size_t n){return read(a,out,n);},buckets);}
+  void part(uint32_t state=2){put(car+0x1bec,0xa0000);put(car+0x1bf0,0xa0004);put(0xa0000,0xa1000);
+    put(0xa1010,state);put(0xa10fc,car);put(0xa12b0,0xa2000);node(0xa2000);}
   Fixture(){
     put(0x67ae34,0x54cd20);put(context+0x1bc,1);put(context+0x1ac,0x82000);put(context+0x1a8,0x82008);put(0x82000,0x61000);
     matrix(camera+0x80);put(0x696dc8,0x10000);put(0x10014,0x11000);put(0x10018,0x11004);put(0x11000,0x40000);put(0x4033c,car);put(car+0x338,0x60000);
@@ -42,6 +44,27 @@ int main(){
     case 5:f.put(f.camera+0x80+15*4,0);break;}
     rejected=false;try{f.select();}catch(...){rejected=true;}assert(rejected);}
   f=Fixture();rejected=false;try{fo2offcamera::select(f.context,0xffffffc0,[&](uint32_t a,void* out,size_t n){return f.read(a,out,n);});}catch(...){rejected=true;}assert(rejected);
+  auto has=[](const Selection& s,uint32_t address,uint32_t state){for(auto n:s.nodes)if(n.address==address&&n.partState==state)return true;return false;};
+  for(uint32_t state:{1u,2u}){
+    f=Fixture();f.part(state);auto before=f.bytes;s=f.select();assert(f.bytes==before);
+    assert(has(s,0xa2000,state)&&s.parts==1&&s.partMeshes==1&&s.looseRoots==(state==1)&&s.releasedRoots==(state==2));
+    f.put(0xa20c8,0x65000);assert(has(f.select(),0xa2000,state)); // Never traverse root-level world siblings.
+    f.matrix(0xa2080,81);assert(!has(f.select(),0xa2000,state));f.matrix(0xa2080,20);assert(has(f.select(),0xa2000,state));
+    f.put(0xa1010,0);assert(!has(f.select(),0xa2000,state)); // Reset/reattachment removes the separate population.
+  }
+  f=Fixture();f.part();f.put(f.car+0x338,0);assert(has(f.select(),0xa2000,2)); // Surviving debris without a car scene root.
+  f=Fixture();f.part();f.put(0xa20c4,0xa3000);f.node(0xa3000);s=f.select();assert(has(s,0xa2000,2)&&has(s,0xa3000,2)&&s.partMeshes==2);
+  f=Fixture();f.part();f.put(f.car+0x1bf0,0xa0008);f.put(0xa0004,0xa1000);s=f.select();assert(s.parts==1&&s.partMeshes==1&&s.coveredParts==1);
+  f=Fixture();f.part();f.put(0xa12b0,0x65000);s=f.select();assert(s.coveredParts==1&&s.partMeshes==0&&has(s,0x65000,0));
+  f=Fixture();f.part();f.put(0xa10fc,f.car+4);assert(!has(f.select(),0xa2000,2));
+  f=Fixture();f.part(3);assert(f.select().partMeshes==0);
+  f=Fixture();f.part();f.put(0xa20c0,0x60000);assert(f.select().partMeshes==0); // Never reparent for reflections.
+  f=Fixture();f.part();f.put(0xa2010,2);assert(f.select().partMeshes==0);
+  f=Fixture();f.part();f.put(0x82000,0xa2000);assert(f.select().partMeshes==0);
+  f=Fixture();f.part();f.put(f.context+0x1b4,0x90000);f.put(0x90000,0x91000);f.put(0x90004,0x91010);f.put(0x90008,0x91020);f.put(0x91004,0xa2080);assert(f.select(0x90000).partMeshes==0);
+  for(unsigned bad=0;bad<3;++bad){f=Fixture();f.part();if(bad==0)f.put(f.car+0x1bf0,0xa0000+129*4);
+    if(bad==1)f.put(0xa20c4,0xa2000);if(bad==2)f.put(0xa0000,0xfffffff0);
+    rejected=false;try{f.select();}catch(...){rejected=true;}assert(rejected);}
   Provenance provenance;provenance.add(0x65080);provenance.setWorld(0x61080);provenance.enter();assert(!provenance.rayOnly());
   provenance.setWorld(0x65080);assert(provenance.rayOnly());provenance.leave();assert(!provenance.rayOnly()); // HUD cannot inherit the last hidden matrix.
   provenance.enter(false);assert(!provenance.rayOnly());provenance.leave(); // Other camera/shadow bucket is ordinary.
@@ -50,5 +73,8 @@ int main(){
   provenance.enter();provenance.enter();provenance.leave();assert(provenance.rayOnly());bool queuedTag=provenance.rayOnly();provenance.reset();assert(!provenance.rayOnly());
   {fo2render::RayOnlyScope command(queuedTag);assert(nativeRayOnly);{fo2render::RayOnlyScope nested(false);assert(!nativeRayOnly);}assert(nativeRayOnly);}assert(!nativeRayOnly);
   try{fo2render::RayOnlyScope command(queuedTag);throw std::runtime_error("test");}catch(...){}assert(!nativeRayOnly);
+  provenance.reset();provenance.add(0xa2080,2);provenance.setWorld(0xa2080);provenance.enter();assert(provenance.kind()==2);
+  int partTag=int(provenance.kind());provenance.reset();
+  {fo2render::RayOnlyScope command(partTag);assert(nativeRayOnly==2);{fo2render::RayOnlyScope carCommand(1);assert(nativeRayOnly==1);}assert(nativeRayOnly==2);}assert(!nativeRayOnly);
   std::puts("Offcamera scene: current hierarchy, visible/hidden/range/ABI/bounds/cycle rejection, read-only selection and queued world provenance passed");
 }

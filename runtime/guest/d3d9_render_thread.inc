@@ -26,7 +26,7 @@ extern "C" void d3d9NoteGameThread();
 namespace rt {
 enum Op:uint16_t {OpDevice,OpAddRef,OpRelease,OpStateBlock,OpSync,OpFunction,OpRefDelta,OpBufferUpdate,OpTexUpload,OpInstancedDraw,OpSurfaceUpload};
 struct SyncSlot {uint32_t token=0;const uint32_t* args=nullptr;uint32_t count=0;uint32_t result=0;std::exception_ptr error;std::function<void()> fn;std::atomic<bool> done{false};};
-struct Cmd {uint16_t op;uint16_t method;uint32_t a[9];const void* p0;const void* p1;void* obj;void* obj2;SyncSlot* sync;bool rayOnly=false;};
+struct Cmd {uint16_t op;uint16_t method;uint32_t a[9];const void* p0;const void* p1;void* obj;void* obj2;SyncSlot* sync;uint8_t rayOnly=0;};
 
 // Ring of queued calls (AS2_QUEUE_BITS, default 16: 65536 calls). A ring small enough for the L2 (12 bits)
 // was measured in Alien Shooter 2: the cache misses on the stores went, but the game thread then waited on a
@@ -134,7 +134,7 @@ void push(const Cmd& c,bool urgent=false){
     {const char* ahead=reinterpret_cast<const char*>(&queue[(h+4)&(queueSize-1)]);__builtin_prefetch(ahead,1,3);__builtin_prefetch(ahead+64,1,3);}
     queue[h&(queueSize-1)]=c;
 #ifdef FO2_METAL
-    queue[h&(queueSize-1)].rayOnly=fo2OffcameraRayOnlyDraw()!=0;
+    queue[h&(queueSize-1)].rayOnly=static_cast<uint8_t>(fo2OffcameraRayOnlyDraw());
 #endif
     head.store(h+1,std::memory_order_release);
     if(urgent||((h+1)&255u)==0)wake();

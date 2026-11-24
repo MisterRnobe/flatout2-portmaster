@@ -140,6 +140,7 @@ struct Draw {
   MaterialHint material;
   bool captureMaterial=false,waterBasisValid=false,hudBoundary=false;
   bool rayOnly=false;
+  bool rayOnlyDetached=false;
   uint32_t physicalWaterAsset=0; // Semantic collision identity captured with this draw.
   std::array<float,9> waterBasis{};
   std::shared_ptr<Shader> vs, ps;

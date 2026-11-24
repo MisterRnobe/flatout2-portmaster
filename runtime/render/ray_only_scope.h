@@ -6,7 +6,7 @@ namespace fo2render {
 class RayOnlyScope {
   int previous;
 public:
-  explicit RayOnlyScope(bool value):previous(fo2MetalSetRayOnly(value?1:0)){}
+  explicit RayOnlyScope(int kind):previous(fo2MetalSetRayOnly(kind)){}
   ~RayOnlyScope(){fo2MetalSetRayOnly(previous);}
   RayOnlyScope(const RayOnlyScope&)=delete;
   RayOnlyScope& operator=(const RayOnlyScope&)=delete;

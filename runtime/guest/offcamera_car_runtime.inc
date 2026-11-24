@@ -12,12 +12,12 @@ int fo2_rt_scene_enabled=[]{
 }();
 }
 struct OffcameraFrame {
-    uint64_t frame=0,batchEntries=0;uint32_t context=0,camera=0,buckets=0;
+    uint64_t frame=0,batchEntries=0;uint32_t context=0,camera=0,buckets=0,kindAtEntry=0;
     bool submitted=false,busy=false,disabled=false,rayOnlyAtEntry=false;
     fo2offcamera::Provenance provenance;
 };
 static thread_local OffcameraFrame offcameraFrame;
-extern "C" int fo2OffcameraRayOnlyDraw(){return offcameraFrame.provenance.rayOnly()?1:0;}
+extern "C" int fo2OffcameraRayOnlyDraw(){return int(offcameraFrame.provenance.kind());}
 extern "C" void fo2_rt_scene_leave(uint32_t){offcameraFrame.provenance.leave();}
 extern "C" void fo2_rt_scene_enter(uint32_t va){
     auto& f=offcameraFrame;
@@ -27,7 +27,7 @@ extern "C" void fo2_rt_scene_enter(uint32_t va){
         std::memcpy(destination,ptr(address,size),size);return true;};
     auto arg=[&](uint32_t offset){uint32_t value=0;if(g_esp<=UINT32_MAX-offset)read(g_esp+offset,&value,4);return value;};
     if(va==0x005A6F20u){f.provenance.setWorld(arg(4));return;}
-    if(va==0x00553CA0u){f.provenance.enter(f.context&&f.buckets&&arg(4)==f.buckets);++f.batchEntries;f.rayOnlyAtEntry=f.provenance.rayOnly();}
+    if(va==0x00553CA0u){f.provenance.enter(f.context&&f.buckets&&arg(4)==f.buckets);++f.batchEntries;f.kindAtEntry=f.provenance.kind();f.rayOnlyAtEntry=f.kindAtEntry!=0;}
     if(!fo2InRace()){f.provenance.reset();f.context=f.camera=f.buckets=0;return;}
     if(f.disabled||f.busy)return;
     if(va==0x004C9B80u){
@@ -41,14 +41,15 @@ extern "C" void fo2_rt_scene_enter(uint32_t va){
     f.submitted=true;f.busy=true;State saved;saved.save();auto started=std::chrono::steady_clock::now();
     try{
         auto selection=fo2offcamera::select(f.context,f.camera,read,f.buckets);
-        for(auto node:selection.nodes){f.provenance.add(node.world);g_ecx=node.address;
+        for(auto node:selection.nodes){f.provenance.add(node.world,node.partState?2:1);g_ecx=node.address;
             callGuest(0x0054CD20u,{f.camera,0,f.buckets});}
         {
             static thread_local unsigned early=0;
             if(f.frame%300==0||early++<3){
                 double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
-                std::printf("[FO2 RT POPULATION] frame=%llu cars=%u visited=%u visible=%u ray-only-nodes=%zu hidden=%u distant=%u unsupported=%u prepare=%.3f ms\n",
-                    (unsigned long long)f.frame,selection.cars,selection.visited,selection.visible,selection.nodes.size(),selection.hidden,selection.distant,selection.unsupported,ms);
+                std::printf("[FO2 RT POPULATION] frame=%llu cars=%u visited=%u visible=%u ray-only-nodes=%zu hidden=%u distant=%u unsupported=%u parts=%u loose=%u released=%u covered-parts=%u part-meshes=%u prepare=%.3f ms\n",
+                    (unsigned long long)f.frame,selection.cars,selection.visited,selection.visible,selection.nodes.size(),selection.hidden,selection.distant,selection.unsupported,
+                    selection.parts,selection.looseRoots,selection.releasedRoots,selection.coveredParts,selection.partMeshes,ms);
             }
         }
     }catch(const std::exception& e){f.disabled=true;
@@ -59,11 +60,11 @@ extern "C" void fo2_rt_scene_enter(uint32_t va){
 static void testOffcameraLiftedScope(){
 #ifdef FO2_METAL
     auto savedFrame=offcameraFrame;State saved;saved.save();int enabled=fo2_rt_scene_enabled;
-    auto physics=lastRacePhysics.load(std::memory_order_relaxed);uint32_t arena=allocate(0x700),bucket=arena+0x500;
+    auto physics=lastRacePhysics.load(std::memory_order_relaxed);uint32_t arena=allocate(0x800),bucket=arena+0x500;
     auto restore=[&]{saved.load();offcameraFrame=std::move(savedFrame);fo2_rt_scene_enabled=enabled;
         lastRacePhysics.store(physics,std::memory_order_relaxed);heaps->free(GuestHeaps::process,arena);};
     try{
-        std::memset(ptr(arena,0x700),0,0x700);offcameraFrame={};fo2_rt_scene_enabled=1;
+        std::memset(ptr(arena,0x800),0,0x800);offcameraFrame={};fo2_rt_scene_enabled=1;
         lastRacePhysics.store(std::chrono::steady_clock::now().time_since_epoch().count(),std::memory_order_relaxed);
         if(!fo2InRace())throw GuestStop("Offcamera fixture expected an unpaused physics marker");
         uint32_t node=arena,cam=arena+0x140,model=arena+0x280,batch=arena+0x2d0,list=arena+0x310,items=arena+0x320,buckets=arena+0x380;
@@ -77,17 +78,25 @@ static void testOffcameraLiftedScope(){
             throw GuestStop("Offcamera lifted mesh did not append its current batch/world after ordinary entries");
         write32(node+0x10,2);callGuest(0x54cd20,{cam,0,buckets});
         if(read32(buckets+4)!=items+32)throw GuestStop("Offcamera lifted mesh ignored authored hidden flag");
-        g_ecx=saved.ecx;
+        uint32_t parent=arena+0x660;write32(parent+0xc4,node);write32(node+0xc0,parent);
+        std::array<uint8_t,64> beforeWorld{};std::memcpy(beforeWorld.data(),ptr(node+0x80,64),64);
+        g_edx=node;callGuest(0x54d040,{});
+        if(read32(parent+0xc4)||read32(node+0xc0)||read32(node+0xc8)||read32(node+0x10)!=2||std::memcmp(beforeWorld.data(),ptr(node+0x80,64),64))
+            throw GuestStop("Detached node unlink changed its world/flags or retained its parent");
+        write32(node+0x10,0);z=6;std::memcpy(ptr(node+0xb8,4),&z,4);g_ecx=node;callGuest(0x54cd20,{cam,0,buckets});
+        if(read32(buckets+4)!=items+48||read32(items+32)!=batch||read32(items+36)!=node+0x80||read32(items+40)!=0x40c00000u||read32(items+44)!=read32(node+0xc))
+            throw GuestStop("Detached mesh did not enqueue its fresh independent transform");
+        g_ecx=saved.ecx;g_edx=saved.edx;
         offcameraFrame.context=arena;offcameraFrame.camera=cam;offcameraFrame.buckets=bucket;offcameraFrame.submitted=true;
-        offcameraFrame.provenance.add(0x123400);offcameraFrame.provenance.setWorld(0x123400);
+        offcameraFrame.provenance.add(0x123400,2);offcameraFrame.provenance.setWorld(0x123400);
         callGuest(0x00553CA0u,{bucket,0});
-        if(offcameraFrame.batchEntries!=1||!offcameraFrame.rayOnlyAtEntry||fo2OffcameraRayOnlyDraw())
+        if(offcameraFrame.batchEntries!=1||!offcameraFrame.rayOnlyAtEntry||offcameraFrame.kindAtEntry!=2||fo2OffcameraRayOnlyDraw())
             throw GuestStop("Lifted offcamera entry/return scope failed (full guest rebuild required)");
         State after;after.save();
         if(after.eax!=saved.eax||after.ecx!=saved.ecx||after.esp!=saved.esp||after.ebp!=saved.ebp||after.ebx!=saved.ebx||after.esi!=saved.esi||after.edi!=saved.edi||
            std::memcmp(after.flags,saved.flags,sizeof saved.flags)||std::memcmp(after.xmm,saved.xmm,sizeof saved.xmm)||std::memcmp(after.st,saved.st,sizeof saved.st))
             throw GuestStop("Offcamera lifted callbacks changed caller CPU state");
-        restore();std::puts("[FO2 RT POPULATION CHECK] actual lifted mesh append, ordinary-entry priority, hidden flags, guest CPU/stack restoration and ray-only return cleanup passed");
+        restore();std::puts("[FO2 RT POPULATION CHECK] lifted mesh append/unlink/fresh detached transform, ordinary-entry priority, hidden flags, CPU/stack and typed ray-only cleanup passed");
     }catch(...){restore();throw;}
 #endif
 }

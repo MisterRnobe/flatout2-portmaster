@@ -53,7 +53,8 @@ inline std::shared_ptr<const TraceCarMaterial> prepareTraceCarMaterial(const Dra
     }
   }
   m->vs=d.vs;m->ps=d.ps;m->vsConstants=d.vsConstants;m->psConstants=d.psConstants;
-  m->effects=d.effects;m->effects[0]=m->effects[3]=0;m->effects[62]=d.rayOnly?1.f:0.f;m->effects[63]=d.colorSrgb?1.f:0.f;m->srgbMask=d.textureSrgbMask;
+  m->effects=d.effects;m->effects[0]=m->effects[3]=0;m->effects[61]=d.rayOnly&&d.rayOnlyDetached?1.f:0.f;
+  m->effects[62]=d.rayOnly?1.f:0.f;m->effects[63]=d.colorSrgb?1.f:0.f;m->srgbMask=d.textureSrgbMask;
   return m;
 }
 inline std::string traceCarMaterialSource(const Shader& vs,const Shader& ps){
@@ -112,6 +113,7 @@ kernel void traceCarShade(constant fo2_fragment_Uniforms& pu [[buffer(1)]],const
  if(h.identity.y)atomic_fetch_add_explicit(counts+6,1u,memory_order_relaxed);
  if(h.identity.y==1)atomic_fetch_add_explicit(counts+7,1u,memory_order_relaxed);
  if(fx[62]>0)atomic_fetch_add_explicit(counts+8,1u,memory_order_relaxed);
+ if(fx[61]>0)atomic_fetch_add_explicit(counts+9,1u,memory_order_relaxed);
 }
 )MSL";
 }

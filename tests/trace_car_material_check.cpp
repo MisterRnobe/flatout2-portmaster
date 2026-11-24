@@ -24,7 +24,8 @@ int main(){
   assert(m->inputs[0][8]==90/255.f&&m->inputs[0][10]==110/255.f); // Shader performs swizzle, not decoder.
   d.streams[0]->bytes.assign(d.streams[0]->bytes.size(),0);d.vsConstants.assign(224,0);assert(m->inputs[0][12]==.5f&&m->vsConstants!=d.vsConstants);
   ++d.textures[0]->version;assert(!m->current());
-  d=fixture();d.colorSrgb=true;assert(material(d)->effects[63]==1);d.rayOnly=true;assert(material(d)->effects[62]==1);
+  d=fixture();d.colorSrgb=true;assert(material(d)->effects[63]==1);d.rayOnlyDetached=true;assert(material(d)->effects[61]==0);
+  d.rayOnly=true;assert(material(d)->effects[62]==1&&material(d)->effects[61]==1);
   for(unsigned which=0;which<10;++which){d=fixture();switch(which){
     case 0:d.ps->hash=1;break;case 1:d.textures[1]->faces=1;break;case 2:d.textures[0]->rgba.clear();break;
     case 3:d.textures[0]->parent=std::make_shared<Image>();break;case 4:d.vsConstants.pop_back();break;
@@ -36,13 +37,14 @@ int main(){
   // UVs are owned afresh even when the raw POSITION mesh is a cache hit.
   d=fixture();d.streams[1]=std::make_shared<Buffer>();float uv[]={.1f,.2f,.3f,.4f,.5f,.6f};d.streams[1]->bytes.resize(sizeof uv);std::memcpy(d.streams[1]->bytes.data(),uv,sizeof uv);
   d.attributes[3]={3,1,0,Element::Float2};d.strides[1]=8;
-  d.rayOnly=true;LiveTraceScene live(true,1,0,{},1,true,true);live.beginDisplayFrame(true,42);live.record(d);
+  d.rayOnly=d.rayOnlyDetached=true;LiveTraceScene live(true,1,0,{},1,true,true);live.beginDisplayFrame(true,42);live.record(d);
   auto s=live.copyDisplayFrame(42,d.color,d.depth,d.debugProjection.values);assert(s&&s->parts.size()==1&&s->parts[0].car);
   float changed=.9f;std::memcpy(d.streams[1]->bytes.data()+16,&changed,4);++d.streams[1]->version;
   live.beginDisplayFrame(true,43);live.record(d);auto next=live.copyDisplayFrame(43,d.color,d.depth,d.debugProjection.values);
   assert(next&&next->cacheHits==1&&next->parts[0].car->inputs[0][12]==.9f&&s->parts[0].car->inputs[0][12]==.5f);
   finalizeLiveTraceSnapshot(*s);assert(s->cars.size()==1&&s->cars[0].firstTriangle==0&&s->cars[0].triangles==1&&s->cars[0].baseVertex==0&&s->cars[0].vertices==3);
   assert(s->rayOnlyDraws==1&&s->cars[0].material->effects[62]==1);
+  assert(s->detachedDraws==1&&s->cars[0].material->effects[61]==1);
   assert(s->scene.indices.size()==3&&s->parts.empty());
   // Material caps do not remove the object's RT geometry.
   live.beginDisplayFrame(true,44);for(unsigned i=0;i<70;++i)live.record(d);

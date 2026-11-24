@@ -52,6 +52,7 @@ struct LiveTracePart {
   std::array<float,4> projection;uint32_t meshId=0;
   std::shared_ptr<const TraceCarMaterial> car;
   bool rayOnly=false;
+  bool detached=false;
 };
 struct LiveTraceCarRange {std::shared_ptr<const TraceCarMaterial> material;uint32_t firstTriangle=0,triangles=0,baseVertex=0,vertices=0;};
 struct LiveTraceSnapshot {
@@ -60,14 +61,14 @@ struct LiveTraceSnapshot {
   uint32_t cacheHits=0,cacheMisses=0;size_t cacheBytes=0,cacheEntries=0;
   bool prepared=false;std::vector<LiveTracePart> parts;
   std::vector<LiveTraceCarRange> cars;
-  uint32_t sample=0,attempts=0,accepted=0,unknown=0,invalid=0,limited=0,otherProjection=0,otherTarget=0,rayOnlyDraws=0;
+  uint32_t sample=0,attempts=0,accepted=0,unknown=0,invalid=0,limited=0,otherProjection=0,otherTarget=0,rayOnlyDraws=0,detachedDraws=0;
 };
 // The diagnostic worker uses immutable owned meshes and copied matrices only.
 // Optional car materials belong to the synchronous shading collector: owned
 // vertex inputs/constants plus version-gated texture references, never buffers.
 inline void finalizeLiveTraceSnapshot(LiveTraceSnapshot& snapshot){
   if(snapshot.prepared)return;auto start=std::chrono::steady_clock::now();auto& scene=snapshot.scene;
-  snapshot.rayOnlyDraws=0;
+  snapshot.rayOnlyDraws=snapshot.detachedDraws=0;
   size_t vertices=0,indices=0;for(const auto& part:snapshot.parts){vertices+=part.mesh->positions.size();indices+=part.mesh->indices.size();}
   if(vertices>traceSceneMaxVertices||indices>size_t(traceSceneMaxTriangles)*3)throw std::runtime_error("Deferred RT scene exceeds limits");
   scene.positions.reserve(vertices);scene.indices.reserve(indices);scene.meshIds.reserve(indices/3);
@@ -86,6 +87,7 @@ inline void finalizeLiveTraceSnapshot(LiveTraceSnapshot& snapshot){
     }catch(const std::runtime_error&){scene.positions.resize(base);++snapshot.invalid;if(snapshot.accepted)--snapshot.accepted;continue;}
     if(part.car)snapshot.cars.push_back({part.car,uint32_t(scene.indices.size()/3),uint32_t(mesh.indices.size()/3),base,uint32_t(mesh.positions.size())});
     if(part.rayOnly)++snapshot.rayOnlyDraws;
+    if(part.detached)++snapshot.detachedDraws;
     for(auto i:mesh.indices)scene.indices.push_back(base+i);
     scene.meshIds.insert(scene.meshIds.end(),mesh.indices.size()/3,part.meshId);
   }
@@ -162,7 +164,7 @@ public:
       if(collectCarMaterials&&carDraws<64&&mesh.positions.size()*64<=8*1024*1024-carBytes){
         car=prepareTraceCarMaterial(d,mesh);if(car){++carDraws;carBytes+=car->inputs.size()*64;}
       }
-      groups[group].parts.push_back({raw.mesh,rows,projection,stats.accepted,car,d.rayOnly});++stats.accepted;groups[group].triangles+=mesh.indices.size()/3;
+      groups[group].parts.push_back({raw.mesh,rows,projection,stats.accepted,car,d.rayOnly,d.rayOnly&&d.rayOnlyDetached});++stats.accepted;groups[group].triangles+=mesh.indices.size()/3;
       if(d.rayOnly)++stats.rayOnlyDraws;
       vertexWork+=uint32_t(mesh.positions.size());triangleWork+=uint32_t(mesh.indices.size()/3);
     }catch(const std::exception&){++stats.invalid;}
