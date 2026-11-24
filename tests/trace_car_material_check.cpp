@@ -49,6 +49,40 @@ int main(){
   // Material caps do not remove the object's RT geometry.
   live.beginDisplayFrame(true,44);for(unsigned i=0;i<70;++i)live.record(d);
   auto many=live.copyDisplayFrame(44,d.color,d.depth,d.debugProjection.values);finalizeLiveTraceSnapshot(*many);assert(many->cars.size()==64&&many->scene.indices.size()==210);
+  // A late independent part replaces an ordinary material, while all scene
+  // triangles remain. A frozen receiver snapshot keeps its earlier ownership.
+  d=fixture();live.beginDisplayFrame(true,46);
+  for(unsigned i=0;i<64;++i)live.record(d);
+  auto frozen=live.copyDisplayFrame(46,d.color,d.depth,d.debugProjection.values);
+  d.rayOnly=true;live.record(d);d.rayOnlyDetached=true;live.record(d);
+  auto priority=live.copyDisplayFrame(46,d.color,d.depth,d.debugProjection.values);
+  finalizeLiveTraceSnapshot(*priority);finalizeLiveTraceSnapshot(*frozen);
+  assert(priority->cars.size()==64&&priority->scene.indices.size()==66*3&&priority->carMaterialEvictions==2);
+  unsigned offcamera=0,detached=0;for(auto& car:priority->cars){offcamera+=car.material->effects[62]>0;detached+=car.material->effects[61]>0;}
+  assert(offcamera==2&&detached==1&&frozen->cars.size()==64);
+  for(auto& car:frozen->cars)assert(car.material->effects[62]==0);
+  // Invalid high-priority draws must not evict valid material; ordinary late
+  // draws must not evict higher/equal-priority entries either.
+  d.attributes.push_back(d.attributes[3]);live.record(d);
+  d.attributes.pop_back();d.rayOnly=d.rayOnlyDetached=false;live.record(d);
+  auto rejectedBudget=live.copyDisplayFrame(46,d.color,d.depth,d.debugProjection.values);finalizeLiveTraceSnapshot(*rejectedBudget);
+  assert(rejectedBudget->cars.size()==64&&rejectedBudget->carMaterialEvictions==2&&rejectedBudget->carMaterialInvalid==1&&rejectedBudget->carMaterialBudgetDrops==1);
+  // Target discard returns the captured materials' budget immediately.
+  live.discardDisplayTarget(std::make_shared<Image>(),{}); // A different target has no effect.
+  live.beginDisplayFrame(true,47);for(unsigned i=0;i<64;++i)live.record(d);
+  live.discardDisplayTarget(d.color,d.depth);live.record(d);
+  auto cleared=live.copyDisplayFrame(47,d.color,d.depth,d.debugProjection.values);finalizeLiveTraceSnapshot(*cleared);
+  assert(cleared->cars.size()==1&&cleared->carMaterialBudgetDrops==0);
+  // Exercise the byte budget independently of the 64-material count cap.
+  d=fixture();auto triangle=d.streams[0]->bytes;unsigned stride=d.strides[0];
+  d.indices.reset();d.baseVertex=0;d.count=16380;d.streams[0]->bytes.resize(4+size_t(d.count)*stride);
+  for(unsigned i=0;i<d.count;++i)std::memcpy(d.streams[0]->bytes.data()+4+size_t(i)*stride,triangle.data()+4+(i%3)*stride,stride);
+  ++d.streams[0]->version;live.beginDisplayFrame(true,48);
+  for(unsigned i=0;i<9;++i)live.record(d);
+  d.rayOnly=d.rayOnlyDetached=true;live.record(d);
+  auto byteBudget=live.copyDisplayFrame(48,d.color,d.depth,d.debugProjection.values);finalizeLiveTraceSnapshot(*byteBudget);
+  size_t retainedBytes=0;detached=0;for(auto& car:byteBudget->cars){retainedBytes+=car.material->inputs.size()*64;detached+=car.material->effects[61]>0;}
+  assert(byteBudget->cars.size()==8&&retainedBytes<=8*1024*1024&&detached==1&&byteBudget->carMaterialBudgetDrops==1&&byteBudget->carMaterialEvictions==1);
   // The asynchronous diagnostic does not own material resources.
   LiveTraceScene diagnostic(true,1,0,{},1,true);diagnostic.beginDisplayFrame(true,45);diagnostic.record(d);
   auto plain=diagnostic.copyDisplayFrame(45,d.color,d.depth,d.debugProjection.values);finalizeLiveTraceSnapshot(*plain);assert(plain->cars.empty());

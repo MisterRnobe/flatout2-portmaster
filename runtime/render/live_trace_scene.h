@@ -62,6 +62,7 @@ struct LiveTraceSnapshot {
   bool prepared=false;std::vector<LiveTracePart> parts;
   std::vector<LiveTraceCarRange> cars;
   uint32_t sample=0,attempts=0,accepted=0,unknown=0,invalid=0,limited=0,otherProjection=0,otherTarget=0,rayOnlyDraws=0,detachedDraws=0;
+  uint32_t carMaterialBudgetDrops=0,carMaterialEvictions=0,carMaterialInvalid=0;
 };
 // The diagnostic worker uses immutable owned meshes and copied matrices only.
 // Optional car materials belong to the synchronous shading collector: owned
@@ -111,6 +112,31 @@ class LiveTraceScene {
   LiveTraceSnapshot stats;std::vector<Group> groups;
   uint64_t displayFrame=0;bool displayArmed=false;
   void clear(){displayArmed=false;armed=false;inputWork=vertexWork=triangleWork=0;carBytes=0;carDraws=0;stats={};groups.clear();}
+  std::shared_ptr<const TraceCarMaterial> retainCarMaterial(const Draw& d,const TraceMesh& mesh){
+    if(!collectCarMaterials||!traceCarDrawEligible(d))return {};
+    if(mesh.positions.size()>16384){++stats.carMaterialInvalid;return {};}
+    constexpr size_t byteLimit=8*1024*1024;size_t bytes=mesh.positions.size()*64;
+    unsigned priority=traceCarPriority(d.rayOnly,d.rayOnlyDetached);
+    std::vector<LiveTracePart*> candidates,evictions;
+    size_t remainingBytes=carBytes;uint32_t remainingDraws=carDraws;
+    if(remainingDraws>=64||bytes>byteLimit-remainingBytes){
+      for(auto& group:groups)for(auto& part:group.parts)
+        if(part.car&&traceCarPriority(part.rayOnly,part.detached)<priority)candidates.push_back(&part);
+      std::stable_sort(candidates.begin(),candidates.end(),[](auto a,auto b){
+        return traceCarPriority(a->rayOnly,a->detached)<traceCarPriority(b->rayOnly,b->detached);});
+      for(auto part:candidates){
+        if(remainingDraws<64&&bytes<=byteLimit-remainingBytes)break;
+        remainingBytes-=part->car->inputs.size()*64;--remainingDraws;evictions.push_back(part);
+      }
+      if(remainingDraws>=64||bytes>byteLimit-remainingBytes){++stats.carMaterialBudgetDrops;return {};}
+    }
+    // Validate and copy before eviction: a malformed late draw must not remove
+    // an earlier material. Geometry is retained regardless of material priority.
+    auto material=prepareTraceCarMaterial(d,mesh);if(!material){++stats.carMaterialInvalid;return {};}
+    for(auto part:evictions)part->car.reset();
+    stats.carMaterialEvictions+=uint32_t(evictions.size());
+    carBytes=remainingBytes+bytes;carDraws=remainingDraws+1;return material;
+  }
 public:
   explicit LiveTraceScene(bool enabled=false,uint32_t frames=120,uint32_t samples=3,LiveTraceLimits budget={},uint32_t initial=0,bool deferred=false,bool carMaterials=false):on(enabled),interval(frames),sampleLimit(samples),initialWarmup(initial?initial:frames),limits(budget),deferPreparation(deferred),collectCarMaterials(carMaterials){}
   bool enabled()const{return on&&(!sampleLimit||completed<sampleLimit);}
@@ -124,6 +150,9 @@ public:
   }
   void discardDisplayTarget(const std::shared_ptr<Image>& color,const std::shared_ptr<Image>& depth){
     if(!displayArmed)return;
+    for(auto& g:groups)if((color&&g.color==color)||(depth&&g.depth==depth))for(auto& part:g.parts)if(part.car){
+      carBytes-=part.car->inputs.size()*64;--carDraws;
+    }
     groups.erase(std::remove_if(groups.begin(),groups.end(),[&](const auto& g){return (color&&g.color==color)||(depth&&g.depth==depth);}),groups.end());
   }
   // Freeze at the same boundary as the receiver depth/color copy. Later
@@ -160,10 +189,7 @@ public:
       inputWork+=std::min(d.count,limits.inputElements-inputWork);
       if(raw.status!=TraceMeshStatus::Ready){if(raw.status==TraceMeshStatus::Limit)++stats.limited;else ++stats.invalid;return;}
       const auto& mesh=*raw.mesh;if(raw.hit)++stats.cacheHits;else ++stats.cacheMisses;
-      std::shared_ptr<const TraceCarMaterial> car;
-      if(collectCarMaterials&&carDraws<64&&mesh.positions.size()*64<=8*1024*1024-carBytes){
-        car=prepareTraceCarMaterial(d,mesh);if(car){++carDraws;carBytes+=car->inputs.size()*64;}
-      }
+      auto car=retainCarMaterial(d,mesh);
       groups[group].parts.push_back({raw.mesh,rows,projection,stats.accepted,car,d.rayOnly,d.rayOnly&&d.rayOnlyDetached});++stats.accepted;groups[group].triangles+=mesh.indices.size()/3;
       if(d.rayOnly)++stats.rayOnlyDraws;
       vertexWork+=uint32_t(mesh.positions.size());triangleWork+=uint32_t(mesh.indices.size()/3);

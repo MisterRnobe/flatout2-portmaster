@@ -48,6 +48,8 @@ The population hooks use five verified EXE entry addresses in three generated EX
 
 Subsequent macOS work also includes independent loose/released part roots from the car's part inventory, with owner/parent validation and a distinct ray-only provenance value (2). This addition likewise awaits gameplay/GPU acceptance; do not collapse the source-kind value to a boolean when porting command transport. See the final section of `MACOS.md`. The prepared iOS branch starts at its published checkpoint; later shared refinements arrive by rebasing onto `macos-metal`.
 
+The Nov 24 user run subsequently exercised detached geometry and passed the GPU material fixture, but did not demonstrate detached reflections in gameplay. Later shared changes prioritize part material capture under the existing budget and use a direct primitive acceleration structure for synchronous water RT (no identity-only TLAS); those changes await a new GPU/gameplay run. Preserve the primitive-AS shader/host pairing when merging. SSR-only iOS bring-up remains independent of hardware RT support.
+
 ## Useful baseline checks
 
 For a local macOS comparison, the private inputs allow a full rebuild without lifting again:

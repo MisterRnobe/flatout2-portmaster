@@ -21,10 +21,14 @@ struct TraceCarMaterial {
     return true;
   }
 };
+inline bool traceCarDrawEligible(const Draw& d){
+  return d.vs&&d.ps&&d.vs->hash==traceCarVS&&d.ps->hash==traceCarPS&&d.ps->cubeSamplerMask==10&&
+     !d.raster.blendOn&&!d.effects[0]&&d.instanceCount==1&&!d.perInstanceMask&&
+     d.vsConstants.size()==224&&d.psConstants.size()==32;
+}
+inline unsigned traceCarPriority(bool rayOnly,bool detached){return rayOnly?(detached?2:1):0;}
 inline std::shared_ptr<const TraceCarMaterial> prepareTraceCarMaterial(const Draw& d,const TraceMesh& mesh){
-  if(!d.vs||!d.ps||d.vs->hash!=traceCarVS||d.ps->hash!=traceCarPS||d.ps->cubeSamplerMask!=10||
-     d.raster.blendOn||d.effects[0]||d.instanceCount!=1||d.perInstanceMask||
-     mesh.positions.size()>16384||d.vsConstants.size()!=224||d.psConstants.size()!=32)return {};
+  if(!traceCarDrawEligible(d)||mesh.positions.size()>16384)return {};
   auto m=std::make_shared<TraceCarMaterial>();
   for(unsigned i=0;i<4;++i){auto t=d.textures[i];
     if(!t||t->parent||t->depth||t==d.color||t==d.depth||t->faces!=(i%2?6u:1u)||!t->width||!t->height||
