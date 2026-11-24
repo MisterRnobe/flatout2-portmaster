@@ -112,18 +112,26 @@ class LiveTraceScene {
   LiveTraceSnapshot stats;std::vector<Group> groups;
   uint64_t displayFrame=0;bool displayArmed=false;
   void clear(){displayArmed=false;armed=false;inputWork=vertexWork=triangleWork=0;carBytes=0;carDraws=0;stats={};groups.clear();}
-  std::shared_ptr<const TraceCarMaterial> retainCarMaterial(const Draw& d,const TraceMesh& mesh){
+  std::shared_ptr<const TraceCarMaterial> retainCarMaterial(const Draw& d,const TraceMesh& mesh,
+      const std::array<std::array<double,4>,4>& rows,const std::array<float,4>& projection){
     if(!collectCarMaterials||!traceCarDrawEligible(d))return {};
     if(mesh.positions.size()>16384){++stats.carMaterialInvalid;return {};}
     constexpr size_t byteLimit=8*1024*1024;size_t bytes=mesh.positions.size()*64;
-    unsigned priority=traceCarPriority(d.rayOnly,d.rayOnlyDetached);
+    double clip[4]{};for(unsigned r=0;r<4;++r){clip[r]=rows[r][3];for(unsigned k=0;k<3;++k)clip[r]+=rows[r][k]*(double(mesh.minimum[k])+mesh.maximum[k])*.5;}
+    float distance=float(std::sqrt(std::pow(clip[0]/projection[0],2)+std::pow(clip[1]/projection[1],2)+clip[3]*clip[3]));
+    if(!std::isfinite(distance)){++stats.carMaterialInvalid;return {};}
+    bool nearVisible=!d.rayOnly&&distance<=8;
+    unsigned priority=traceCarPriority(d.rayOnly,d.rayOnlyDetached,nearVisible);
     std::vector<LiveTracePart*> candidates,evictions;
     size_t remainingBytes=carBytes;uint32_t remainingDraws=carDraws;
     if(remainingDraws>=64||bytes>byteLimit-remainingBytes){
-      for(auto& group:groups)for(auto& part:group.parts)
-        if(part.car&&traceCarPriority(part.rayOnly,part.detached)<priority)candidates.push_back(&part);
+      for(auto& group:groups)for(auto& part:group.parts)if(part.car){
+        unsigned old=traceCarPriority(part.rayOnly,part.detached,part.car->effects[60]>0);
+        if(old<priority||(priority==3&&old==3&&distance+.05f<part.car->cameraDistance))candidates.push_back(&part);
+      }
       std::stable_sort(candidates.begin(),candidates.end(),[](auto a,auto b){
-        return traceCarPriority(a->rayOnly,a->detached)<traceCarPriority(b->rayOnly,b->detached);});
+        auto pa=traceCarPriority(a->rayOnly,a->detached,a->car->effects[60]>0),pb=traceCarPriority(b->rayOnly,b->detached,b->car->effects[60]>0);
+        return pa!=pb?pa<pb:pa==3&&a->car->cameraDistance>b->car->cameraDistance;});
       for(auto part:candidates){
         if(remainingDraws<64&&bytes<=byteLimit-remainingBytes)break;
         remainingBytes-=part->car->inputs.size()*64;--remainingDraws;evictions.push_back(part);
@@ -132,7 +140,7 @@ class LiveTraceScene {
     }
     // Validate and copy before eviction: a malformed late draw must not remove
     // an earlier material. Geometry is retained regardless of material priority.
-    auto material=prepareTraceCarMaterial(d,mesh);if(!material){++stats.carMaterialInvalid;return {};}
+    auto material=prepareTraceCarMaterial(d,mesh,distance);if(!material){++stats.carMaterialInvalid;return {};}
     for(auto part:evictions)part->car.reset();
     stats.carMaterialEvictions+=uint32_t(evictions.size());
     carBytes=remainingBytes+bytes;carDraws=remainingDraws+1;return material;
@@ -189,7 +197,7 @@ public:
       inputWork+=std::min(d.count,limits.inputElements-inputWork);
       if(raw.status!=TraceMeshStatus::Ready){if(raw.status==TraceMeshStatus::Limit)++stats.limited;else ++stats.invalid;return;}
       const auto& mesh=*raw.mesh;if(raw.hit)++stats.cacheHits;else ++stats.cacheMisses;
-      auto car=retainCarMaterial(d,mesh);
+      auto car=retainCarMaterial(d,mesh,rows,projection);
       groups[group].parts.push_back({raw.mesh,rows,projection,stats.accepted,car,d.rayOnly,d.rayOnly&&d.rayOnlyDetached});++stats.accepted;groups[group].triangles+=mesh.indices.size()/3;
       if(d.rayOnly)++stats.rayOnlyDraws;
       vertexWork+=uint32_t(mesh.positions.size());triangleWork+=uint32_t(mesh.indices.size()/3);

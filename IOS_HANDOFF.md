@@ -52,6 +52,8 @@ The Nov 24 user run subsequently exercised detached geometry and passed the GPU 
 
 Later RT material shading adds per-material GPU hit worklists (histogram/prefix/scatter plus indirect dispatch) within the same RT command buffer. Preserve the shader buffer slots 8–10 and host worklist allocation/ordering together; the default can be disabled with `FO2_RT_CAR_WORKLIST=0`. Its exact GPU comparison fixture and new gameplay acceptance are pending. This optional RT-only optimization is not needed for initial SSR-only iOS bring-up. See the latest `MACOS.md` section for memory budgets and diagnostics.
 
+The next macOS user run passed the exact worklist GPU comparison. A subsequent capture change protects nearby visible body materials against offcamera population starvation, with proximity diagnostics in effects slot 60 and RT counter 10 (11 total counters). Merge the material source and counter allocation together. This newer nearby-material policy still awaits GPU/gameplay acceptance and does not identify the local player explicitly.
+
 ## Useful baseline checks
 
 For a local macOS comparison, the private inputs allow a full rebuild without lifting again:

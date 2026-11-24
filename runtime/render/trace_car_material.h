@@ -2,6 +2,7 @@
 #include "trace_mesh.h"
 #include "shader_capture.h"
 #include <regex>
+#include <limits>
 namespace fo2render {
 // First bounded hit-material family: the inspected, linear-position car body.
 // No guessed skinning, material classification or previous-frame geometry.
@@ -16,6 +17,7 @@ struct TraceCarMaterial {
   std::array<Sampler,4> samplers;
   uint32_t srgbMask=0;
   std::array<float,64> effects{};
+  float cameraDistance=std::numeric_limits<float>::infinity();
   bool current()const{
     for(unsigned i=0;i<4;++i)if(!textures[i]||textures[i]->version!=versions[i])return false;
     return true;
@@ -26,8 +28,8 @@ inline bool traceCarDrawEligible(const Draw& d){
      !d.raster.blendOn&&!d.effects[0]&&d.instanceCount==1&&!d.perInstanceMask&&
      d.vsConstants.size()==224&&d.psConstants.size()==32;
 }
-inline unsigned traceCarPriority(bool rayOnly,bool detached){return rayOnly?(detached?2:1):0;}
-inline std::shared_ptr<const TraceCarMaterial> prepareTraceCarMaterial(const Draw& d,const TraceMesh& mesh){
+inline unsigned traceCarPriority(bool rayOnly,bool detached,bool nearVisible=false){return nearVisible?3:rayOnly?(detached?2:1):0;}
+inline std::shared_ptr<const TraceCarMaterial> prepareTraceCarMaterial(const Draw& d,const TraceMesh& mesh,float distance=std::numeric_limits<float>::infinity()){
   if(!traceCarDrawEligible(d)||mesh.positions.size()>16384)return {};
   auto m=std::make_shared<TraceCarMaterial>();
   for(unsigned i=0;i<4;++i){auto t=d.textures[i];
@@ -57,7 +59,9 @@ inline std::shared_ptr<const TraceCarMaterial> prepareTraceCarMaterial(const Dra
     }
   }
   m->vs=d.vs;m->ps=d.ps;m->vsConstants=d.vsConstants;m->psConstants=d.psConstants;
-  m->effects=d.effects;m->effects[0]=m->effects[3]=0;m->effects[61]=d.rayOnly&&d.rayOnlyDetached?1.f:0.f;
+  m->cameraDistance=distance;
+  m->effects=d.effects;m->effects[60]=!d.rayOnly&&std::isfinite(distance)&&distance<=8?1.f:0.f;
+  m->effects[0]=m->effects[3]=0;m->effects[61]=d.rayOnly&&d.rayOnlyDetached?1.f:0.f;
   m->effects[62]=d.rayOnly?1.f:0.f;m->effects[63]=d.colorSrgb?1.f:0.f;m->srgbMask=d.textureSrgbMask;
   return m;
 }
@@ -122,6 +126,7 @@ kernel void traceCarShade(constant fo2_fragment_Uniforms& pu [[buffer(1)]],const
  if(h.identity.y==1)atomic_fetch_add_explicit(counts+7,1u,memory_order_relaxed);
  if(fx[62]>0)atomic_fetch_add_explicit(counts+8,1u,memory_order_relaxed);
  if(fx[61]>0)atomic_fetch_add_explicit(counts+9,1u,memory_order_relaxed);
+ if(fx[60]>0)atomic_fetch_add_explicit(counts+10,1u,memory_order_relaxed);
 }
 // One histogram/scatter visit per hit pixel, rather than a full grid per
 // material. Prefix is deliberately a single bounded (<=64) serial scan.

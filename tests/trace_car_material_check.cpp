@@ -18,6 +18,10 @@ static Draw fixture(){
   d.baseVertex=-1;d.count=3;return d;
 }
 static std::shared_ptr<const TraceCarMaterial> material(const Draw& d){auto raw=prepareTraceMesh(d);assert(raw.status==TraceMeshStatus::Ready);return prepareTraceCarMaterial(d,raw.mesh);}
+static void moveBack(Draw& d,float distance){
+  float z,w;std::memcpy(&z,d.vsConstants.data()+44,4);std::memcpy(&w,d.vsConstants.data()+60,4);z+=1.01f*distance;w+=distance;
+  std::memcpy(d.vsConstants.data()+44,&z,4);std::memcpy(d.vsConstants.data()+60,&w,4);
+}
 int main(){
   auto d=fixture();auto m=material(d);assert(m&&m->inputs.size()==3&&m->current());
   assert(m->inputs[0][0]==0&&m->inputs[0][1]==1&&m->inputs[0][12]==.5f);assert(m->inputs[0][3]==1);
@@ -51,7 +55,7 @@ int main(){
   auto many=live.copyDisplayFrame(44,d.color,d.depth,d.debugProjection.values);finalizeLiveTraceSnapshot(*many);assert(many->cars.size()==64&&many->scene.indices.size()==210);
   // A late independent part replaces an ordinary material, while all scene
   // triangles remain. A frozen receiver snapshot keeps its earlier ownership.
-  d=fixture();live.beginDisplayFrame(true,46);
+  d=fixture();moveBack(d,20);live.beginDisplayFrame(true,46);
   for(unsigned i=0;i<64;++i)live.record(d);
   auto frozen=live.copyDisplayFrame(46,d.color,d.depth,d.debugProjection.values);
   d.rayOnly=true;live.record(d);d.rayOnlyDetached=true;live.record(d);
@@ -74,7 +78,7 @@ int main(){
   auto cleared=live.copyDisplayFrame(47,d.color,d.depth,d.debugProjection.values);finalizeLiveTraceSnapshot(*cleared);
   assert(cleared->cars.size()==1&&cleared->carMaterialBudgetDrops==0);
   // Exercise the byte budget independently of the 64-material count cap.
-  d=fixture();auto triangle=d.streams[0]->bytes;unsigned stride=d.strides[0];
+  d=fixture();moveBack(d,20);auto triangle=d.streams[0]->bytes;unsigned stride=d.strides[0];
   d.indices.reset();d.baseVertex=0;d.count=16380;d.streams[0]->bytes.resize(4+size_t(d.count)*stride);
   for(unsigned i=0;i<d.count;++i)std::memcpy(d.streams[0]->bytes.data()+4+size_t(i)*stride,triangle.data()+4+(i%3)*stride,stride);
   ++d.streams[0]->version;live.beginDisplayFrame(true,48);
@@ -83,6 +87,23 @@ int main(){
   auto byteBudget=live.copyDisplayFrame(48,d.color,d.depth,d.debugProjection.values);finalizeLiveTraceSnapshot(*byteBudget);
   size_t retainedBytes=0;detached=0;for(auto& car:byteBudget->cars){retainedBytes+=car.material->inputs.size()*64;detached+=car.material->effects[61]>0;}
   assert(byteBudget->cars.size()==8&&retainedBytes<=8*1024*1024&&detached==1&&byteBudget->carMaterialBudgetDrops==1&&byteBudget->carMaterialEvictions==1);
+  // Nearby visible body materials survive late offcamera parts. This guards
+  // the chased car against a saturated ray-only population's capture order.
+  d=fixture();auto near=d;moveBack(d,20);live.beginDisplayFrame(true,49);
+  for(unsigned i=0;i<64;++i)live.record(d);
+  live.record(near);d.rayOnly=d.rayOnlyDetached=true;
+  for(unsigned i=0;i<64;++i)live.record(d);
+  auto protectedCar=live.copyDisplayFrame(49,d.color,d.depth,d.debugProjection.values);finalizeLiveTraceSnapshot(*protectedCar);
+  unsigned nearest=0;for(auto& car:protectedCar->cars)nearest+=car.material->effects[60]>0;
+  assert(protectedCar->cars.size()==64&&nearest==1&&protectedCar->scene.indices.size()==129*3);
+  // If all retained materials are near-visible, prefer the closer ones;
+  // far parts and farther visible candidates cannot evict them.
+  d=fixture();moveBack(d,3);near=d;live.beginDisplayFrame(true,50);
+  for(unsigned i=0;i<64;++i)live.record(d);
+  moveBack(near,-2);live.record(near);moveBack(d,20);d.rayOnly=d.rayOnlyDetached=true;live.record(d);
+  auto closest=live.copyDisplayFrame(50,d.color,d.depth,d.debugProjection.values);finalizeLiveTraceSnapshot(*closest);
+  unsigned closer=0;for(auto& car:closest->cars){assert(car.material->effects[60]==1);closer+=car.material->cameraDistance<6;}
+  assert(closer==1&&closest->carMaterialBudgetDrops==1&&closest->carMaterialEvictions==1);
   // The asynchronous diagnostic does not own material resources.
   LiveTraceScene diagnostic(true,1,0,{},1,true);diagnostic.beginDisplayFrame(true,45);diagnostic.record(d);
   auto plain=diagnostic.copyDisplayFrame(45,d.color,d.depth,d.debugProjection.values);finalizeLiveTraceSnapshot(*plain);assert(plain->cars.empty());
