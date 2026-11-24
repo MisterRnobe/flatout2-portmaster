@@ -1,5 +1,7 @@
 #pragma once
 #include "material.h"
+#include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -7,6 +9,15 @@
 #include <string>
 namespace fo2render {
 inline constexpr MaterialHint worldWaterMaterial(){return {.04f,.08f,MaterialCue::WorldWater};}
+// Visibility control for diagnostic puddle tests, separate from Fresnel/F0.
+// Ordinary gameplay defaults to unit gain; invalid input never reaches MSL.
+inline float parseWaterReflectionGain(const char* value){
+  if(!value||!*value)return 1;
+  char* end=nullptr;float gain=std::strtof(value,&end);
+  if(end==value||*end||!std::isfinite(gain))return 1;
+  return std::max(1.f,std::min(8.f,gain));
+}
+inline float waterReflectionGain(){static const float gain=parseWaterReflectionGain(std::getenv("FO2_WATER_REFLECTION_GAIN"));return gain;}
 // Verified against the user's pro_water.sha (shader-library entry 26 / ID 25)
 // and its captured 164-byte ps.1.1 program. Never classify a generic 2D shader.
 inline bool worldWaterProgram(uint64_t hash,size_t bytes,uint32_t activeCubes,bool premultiplied,

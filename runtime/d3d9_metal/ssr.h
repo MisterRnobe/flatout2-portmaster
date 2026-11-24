@@ -169,7 +169,8 @@ fragment float4 ssrCompositePS(float4 pixel [[position]],texture2d<float> base [
     float3 reference=water?waterScene.read(p).rgb:scene.read(p).rgb;
     float3 delta=abs(original.rgb-reference);
     float difference=max(max(delta.r,delta.g),delta.b);
-    float weight=hit.a*(1-smoothstep(.08,.25,difference));
+    float gain=water&&isfinite(c[1].y)&&c[1].y>=1?clamp(c[1].y,1.0,8.0):1.0;
+    float weight=clamp(hit.a*gain,0.0,1.0)*(1-smoothstep(.08,.25,difference));
     if(c[2].w>.5 && !water){float4 m=materials.read(p);if(m.r==0||abs(m.b*255-c[3].w)<.5)weight=0;}
     return float4(mix(original.rgb,hit.rgb,weight),original.a);
 }

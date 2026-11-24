@@ -1272,6 +1272,7 @@ std::shared_ptr<Image> Renderer::screenReflections(const std::shared_ptr<Image>&
     if(!impl->debugVS)impl->debugVS=shader("debugVS",true,0);
   }
   float constants[16]{};std::copy(impl->selectedProjection.values.begin(),impl->selectedProjection.values.end(),constants);
+  constants[5]=waterReflectionGain();
   constants[12]=water?1:0;constants[13]=worldWaterMaterial().reflectivity;constants[14]=worldWaterMaterial().roughness;constants[15]=float(unsigned(MaterialCue::WorldWater));
   constants[6]=impl->selectedShift[0];constants[7]=impl->selectedShift[1];constants[8]=w;constants[9]=h;constants[10]=mask?1:0;constants[11]=impl->debugCaptureMaterials?1:0;
   Draw d;d.color=impl->ssrHalf;d.vs=impl->debugVS;d.ps=impl->ssrPS;d.count=3;
@@ -1348,6 +1349,7 @@ bool Renderer::captureReflectionDiagnostics(const std::string& directory,const s
     // cached reflection image may be overwritten by screenshot diagnostics.
     auto mask=makeImage(impl->width,impl->height),hits=makeImage((impl->width+1)/2,(impl->height+1)/2);
     float c[16]{};std::copy(impl->selectedProjection.values.begin(),impl->selectedProjection.values.end(),c);
+    c[5]=waterReflectionGain();
     c[6]=impl->selectedShift[0];c[7]=impl->selectedShift[1];c[11]=impl->debugCaptureMaterials?1:0;
     c[12]=water?1:0;c[13]=worldWaterMaterial().reflectivity;c[14]=worldWaterMaterial().roughness;c[15]=float(unsigned(MaterialCue::WorldWater));
     Draw d;d.vs=impl->debugVS;d.ps=impl->ssrPS;d.count=3;d.raster.depthOn=d.raster.depthWrite=false;
@@ -1456,6 +1458,8 @@ fragment float4 inspectionDepthPS(float4 p [[position]],depth2d<float,access::re
       @"half_resolution_water_nonzero_confidence_pixels":@(waterHitPixels),@"opaque_unknown_pixels":@(cues[0]),@"opaque_cube_pixels":@(cues[1]),
       @"opaque_fixed_specular_pixels":@(cues[2]),@"opaque_water_cue_pixels":@(cues[3]),@"opaque_terrain_specular_pixels":@(cues[4]),
       @"rt_same_frame_compared":@(rtCompared),@"rt_source_frame":@(impl->currentWaterTraceFrame),
+      @"water_reflection_gain":@(waterReflectionGain()),
+      @"rt_near_visible_material_hits":@(rtCompared&&impl->waterTrace?impl->waterTrace->nearVisibleMaterialHitCount():0),
       @"rt_ray_only_material_hits":@(rtCompared&&impl->waterTrace?impl->waterTrace->rayOnlyMaterialHitCount():0),
       @"rt_detached_material_hits":@(rtCompared&&impl->waterTrace?impl->waterTrace->detachedMaterialHitCount():0),
       @"rt_vs_ssr_changed_pixels":@(rtChanged),@"rt_vs_ssr_changed_pixels_at_least_3_levels":@(rtSignificant),

@@ -303,6 +303,9 @@ static void cpuChecks() {
 int checkMetalShaders(const char *directory, bool gpu) {
   cpuChecks();
   auto car=traceCarFixtureDraw();auto carSource=traceCarMaterialSource(*car.vs,*car.ps);
+  require(parseWaterReflectionGain(nullptr)==1&&parseWaterReflectionGain("1")==1&&parseWaterReflectionGain("4")==4&&
+          parseWaterReflectionGain("999")==8&&parseWaterReflectionGain("-2")==1&&parseWaterReflectionGain("nan")==1&&
+          parseWaterReflectionGain("inf")==1&&parseWaterReflectionGain("4junk")==1,"Water reflection gain input bounds failed");
   require(carSource.find("discard_fragment")==std::string::npos&&carSource.find("bias(")==std::string::npos,"RT car source requires derivative-free samples");
   std::filesystem::create_directories("work/metal/msl");std::ofstream("work/metal/msl/trace-car-material.metal")<<carSource;
   std::unique_ptr<Renderer> renderer;
@@ -483,8 +486,12 @@ static void checkHybridWaterComposite(Renderer& renderer,const Draw& fixture){
   auto render=[&]{d.psConstants.resize(sizeof c);std::memcpy(d.psConstants.data(),c,sizeof c);renderer.draw(d);return renderer.read(d.color);};
   nearPixel(render(),8,8,{0,128,127,255},"Disabled water RT changed SSR");
   c[4]=1;nearPixel(render(),8,8,{128,0,127,255},"Water RT did not replace valid water radiance");
+  c[5]=4;solid(rt,{255,0,0,16});nearPixel(render(),8,8,{64,0,191,255},"Water diagnostic gain did not reveal a weak RT reflection");
+  c[5]=1;nearPixel(render(),8,8,{16,0,239,255},"Unit water gain changed original reflection strength");
+  c[5]=4;solid(rt,{255,0,0,128});nearPixel(render(),8,8,{255,0,0,255},"Water reflection gain did not clamp safely");
+  c[5]=0;
   solid(rt,{255,0,0,0});nearPixel(render(),8,8,{0,128,127,255},"Water RT miss lost SSR fallback");
-  solid(rt,{255,0,0,128});solid(base,{255,255,0,255});nearPixel(render(),8,8,{255,255,0,255},"Water RT overwrote HUD");
+  c[5]=4;solid(rt,{255,0,0,128});solid(base,{255,255,0,255});nearPixel(render(),8,8,{255,255,0,255},"Water RT overwrote HUD");
   solid(base,{0,0,255,255});solid(normals,{128,128,255,0});nearPixel(render(),8,8,{0,0,255,255},"Water RT leaked onto nonwater");
   d.color=image(4,4);d.raster.viewport[2]=d.raster.viewport[3]=4;
   d.ps=sourceShader(std::string(debugViewSource)+ssrSource,"reflectionCopyPS");d.ps->samplerMask=1;d.textures[0]=rt;
