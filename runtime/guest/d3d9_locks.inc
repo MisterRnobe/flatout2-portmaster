@@ -78,7 +78,7 @@ HRESULT lockSurface(uint32_t address,uint32_t output,const RECT* rect,uint32_t f
     if(!output||resourceLocks.count(lockKey(address,0)))return D3DERR_INVALIDCALL;
     auto surface=nativeObject<IDirect3DSurface9>(address);if(!surface)return D3DERR_INVALIDCALL;
     D3DSURFACE_DESC desc{};HRESULT status=surface->GetDesc(&desc);if(FAILED(status))return status;
-    static const bool logLocks=std::getenv("AS2_LOCK_LOG")!=nullptr;static uint32_t logged=0;
+    static const bool logLocks=[]{const char* startup=std::getenv("FO2_STARTUP_TRACE");return std::getenv("AS2_LOCK_LOG")!=nullptr||(startup&&startup[0]=='1');}();static uint32_t logged=0;
     if(logLocks&&logged<300&&++logged)NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","[AS2 LOCK] surface %08x %ux%u fmt=%u flags=%x rect=%d,%d-%d,%d",address,desc.Width,desc.Height,unsigned(desc.Format),flags,
         rect?int(rect->left):-1,rect?int(rect->top):-1,rect?int(rect->right):-1,rect?int(rect->bottom):-1);
     D3DLOCKED_RECT lock{};status=surface->LockRect(&lock,rect,flags);if(FAILED(status))return status;return lockPixels(address,0,desc,lock,rect,flags,output);

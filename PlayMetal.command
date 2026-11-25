@@ -40,6 +40,9 @@ archive_failed_run() {
         cp "$FO2_METAL_SESSION_DIR/play.log" "$archived"
         echo "Failed run archived: $archived"
     fi
+    if [[ "${FO2_STARTUP_TRACE:-0}" == 1 && -f "$FO2_METAL_SESSION_DIR/play.log" ]]; then
+        python3 scripts/summarize_startup.py "$FO2_METAL_SESSION_DIR" --output "$FO2_METAL_SESSION_DIR/startup-summary.json" || echo 'Startup summary unavailable; raw play.log retained.'
+    fi
 }
 trap archive_failed_run EXIT
 binary="${FO2_METAL_BINARY:-$PWD/work/metal/fo2-metal}"

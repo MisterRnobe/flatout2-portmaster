@@ -515,11 +515,24 @@ extern "C" int nfs_fx_cap_depth;
 extern "C" void nfs_fx_capture(uint32_t token,const uint32_t* args,uint32_t count,int deferred);
 void guestFrameLog();
 void d3dDispatch(){uint32_t args[32];std::memcpy(args,ptr(g_esp+4,48),48);uint32_t count=0;uint32_t token=d3dToken;
+    // Startup-only surface calls: separate time inside the bridge from
+    // guest work between LockRect and UnlockRect. Capture real return PCs;
+    // g_cur_func is intentionally disabled in the optimized lifted build.
+    static const bool startupTrace=[]{const char* e=std::getenv("FO2_STARTUP_TRACE");return e&&e[0]=='1';}();
+    static thread_local unsigned startupSurfaceCalls=0;
+    const bool startupSurface=startupTrace&&(token==0x7e0050d0u||token==0x7e0050e0u)&&startupSurfaceCalls<128&&
+        lastPresentMs.load(std::memory_order_relaxed)==0;
+    std::chrono::steady_clock::time_point startupCallStart;
+    if(startupSurface){++startupSurfaceCalls;startupCallStart=std::chrono::steady_clock::now();
+        NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"FO2 STARTUP D3D","enter token=%08x object=%08x caller=%08x",token,args[0],read32(g_esp));}
+    auto finishStartupSurface=[&](uint32_t result){if(startupSurface)
+        NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"FO2 STARTUP D3D","leave token=%08x object=%08x result=%08x bridge_ms=%.3f",token,args[0],result,
+            std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-startupCallStart).count());};
     if(token==0x7e002110u)guestFrameLog();
     if(__builtin_expect(nfs_fx_cap_depth!=0,0))nfs_fx_capture(token,nullptr,0,0);  // effect state memo: not replayable
     // Fast path: a queued (or filtered) call other than Present returns straight away.
     if(parallelGuest&&token!=0x7e002110u){uint32_t result;
-        if(dispatchGuestD3D9TryDefer(token,args,&count,&result)){qpcStreak=0;ret(result,count);return;}}
+        if(dispatchGuestD3D9TryDefer(token,args,&count,&result)){finishStartupSurface(result);qpcStreak=0;ret(result,count);return;}}
     qpcStreak=0;  // drawing: not a busy-wait (see performanceCounter)
     static uint64_t bridgeCalls=0;static std::chrono::nanoseconds bridgeTime{},presentTime{};
     // Time one call in 64 (and every Present) so the statistic does not cost
@@ -541,6 +554,7 @@ void d3dDispatch(){uint32_t args[32];std::memcpy(args,ptr(g_esp+4,48),48);uint32
         }
     }catch(...){
         NFS_RUNTIME_LOG(ANDROID_LOG_ERROR,"NFSU2","D3D9 guest caller=%08x stack=%08x token=%08x self=%08x",g_cur_func,g_esp,token,args[0]);throw;}
+    finishStartupSurface(result);
     if(timed){auto spent=std::chrono::steady_clock::now()-bridgeStart;bridgeTime+=token==0x7e002110u?spent:spent*64;presentTime+=token==0x7e002110u?spent:std::chrono::nanoseconds{};}
     if(token==0x7e002110u){
         nfs_widescreen_apply_frame_rate();

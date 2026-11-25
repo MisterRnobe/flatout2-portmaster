@@ -75,3 +75,7 @@ Native CPU tests under `tests/` include geometry/caching/ownership, car-material
 ### Verified puddle reflection replacement follow-up
 
 The macOS race test now opts into `FO2_WATER_REPLACE_REFLECTION=1` with unit diagnostic gain. New `runtime/render/water_replacement.h` generates private MRT variants only for the inspected opaque non-sRGB cube-window water family; other families retain the old path. `renderer.mm` stores one additional RGBA8 image per water layer, clears/invalidate metadata, and binds compositor textures 9 (signed authored contribution/coverage) and 10 (water-pass color). Keep the updated compositor sampler mask (2047) and `ssr.h` texture signature together when rebasing. No guest ABI or game asset change is required. The frozen iOS checkpoint/branch is unchanged. GPU fixtures were extended; hardware acceptance must run on the destination device. This is not general sRGB, blended-water or arbitrary-postprocessing replacement.
+
+### Startup timing follow-up
+
+`FO2_STARTUP_TRACE=1` now adds bounded pre-Present surface LockRect/UnlockRect entry/return records (including deferred bridge calls and actual guest return PC). Changes are limited to host/runtime diagnostics, plus `scripts/summarize_startup.py` and automatic summary generation from `PlayMetal.command`. No lift regeneration, rendering equation or iOS checkpoint change is required. Live timing acceptance awaits the next desktop launch.
