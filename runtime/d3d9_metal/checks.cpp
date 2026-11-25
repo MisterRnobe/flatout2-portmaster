@@ -34,6 +34,10 @@ fragment fo2_fragment_Output waterNormalTestPS(){
   fo2_fragment_Output output;output.oC0=float4(.5,1,.5,1);return output;
 }
 )MSL";
+static std::shared_ptr<Shader> testWaterNormalPS(){
+  auto shader=std::make_shared<Shader>();shader->source=waterNormalTestSource;
+  shader->entry="waterNormalTestPS";shader->hash=shaderHash(shader->source.data(),shader->source.size());return shader;
+}
 static Bytes bytecode(std::initializer_list<uint32_t> words) {
   Bytes b(words.size() * 4);
   std::memcpy(b.data(), words.begin(), b.size());
@@ -310,7 +314,7 @@ static void cpuChecks() {
           "BGRA vertex input swizzle missing");
   // Exercise this exact fixture transformation even without a Metal device;
   // otherwise the opaque-output mismatch is discovered only in GPU preflight.
-  auto fixtureMetadata=waterLegacyZeroSource(waterNormalTestSource);
+  auto fixtureMetadata=waterLegacyZeroSource(testWaterNormalPS()->source);
   require(fixtureMetadata.find("float4 fo2legacy [[color(1)]];")!=std::string::npos&&
           fixtureMetadata.find("output.fo2legacy=float4(.5,.5,.5,0);")!=std::string::npos,
           "Water normal fixture does not support the metadata attachment");
@@ -626,10 +630,7 @@ static void checkSSR(Renderer& renderer,const Draw& fixture,bool materials=false
     quad({{{0,-.9f,-1.1f},{8,-.9f,-1.1f},{0,-.9f,-8},{8,-.9f,-1.1f},{8,-.9f,-8},{0,-.9f,-8}}},{.1f,.2f,.3f,0});
   }
   if(water){
-    auto colorPS=std::make_shared<Shader>(*d.ps);colorPS->waterVariant=std::make_shared<Shader>();
-    auto normal=colorPS->waterVariant;
-    normal->source="#include <metal_stdlib>\nusing namespace metal;fragment float4 waterReflectionTestPS(){return float4(.5,1,.5,1);}";
-    normal->entry="waterReflectionTestPS";normal->hash=shaderHash(normal->source.data(),normal->source.size());d.ps=colorPS;
+    auto colorPS=std::make_shared<Shader>(*d.ps);colorPS->waterVariant=testWaterNormalPS();d.ps=colorPS;
     d.effects[0]=0;d.waterBasisValid=true;d.waterBasis={1,0,0,0,1,0,0,0,1};
     d.raster.depthWrite=false;d.raster.blendOn=true;d.raster.src=Blend::One;d.raster.dst=Blend::InvSrcAlpha;
     quad({{{-8,-.95f,-1.1f},{8,-.95f,-1.1f},{-8,-.95f,-8},{8,-.95f,-1.1f},{8,-.95f,-8},{-8,-.95f,-8}}},{0,.1f,.2f,.5f},worldWaterMaterial());
@@ -706,9 +707,7 @@ static void checkWater(Renderer& renderer,const Draw& fixture,bool stencil=false
   geometry({{-1,-1,.9f,1},{3,-1,.9f,1},{-1,3,.9f,1}},{.1f,.2f,.3f,1});
   geometry({{-.75f,.25f,.4f,1},{-.25f,.25f,.4f,1},{-.75f,.75f,.4f,1},
             {-.25f,.25f,.4f,1},{-.25f,.75f,.4f,1},{-.75f,.75f,.4f,1}},{0,1,0,1});
-  auto waterPS=std::make_shared<Shader>(*d.ps);waterPS->waterVariant=std::make_shared<Shader>();
-  waterPS->waterVariant->source=waterNormalTestSource;
-  waterPS->waterVariant->entry="waterNormalTestPS";waterPS->waterVariant->hash=shaderHash(waterPS->waterVariant->source.data(),waterPS->waterVariant->source.size());
+  auto waterPS=std::make_shared<Shader>(*d.ps);waterPS->waterVariant=testWaterNormalPS();
   d.ps=waterPS;d.material=worldWaterMaterial();d.waterBasisValid=true;d.waterBasis={1,0,0,0,1,0,0,0,1};
   d.raster.depthWrite=false;d.raster.blendOn=true;d.raster.src=Blend::One;d.raster.dst=Blend::InvSrcAlpha;
   geometry({{-1,-1,.6f,1},{0,-1,.6f,1},{-1,1,.6f,1},{0,-1,.6f,1},{0,1,.6f,1},{-1,1,.6f,1}},{0,.1f,.2f,.5f});
