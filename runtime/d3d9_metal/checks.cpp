@@ -25,6 +25,15 @@ static void require(bool ok, const char *text) {
   if (!ok)
     throw std::runtime_error(text);
 }
+// The water-layer GPU fixture uses the same named output interface as the
+// translated normal shaders, so the optional metadata attachment can be added.
+static constexpr const char* waterNormalTestSource=R"MSL(#include <metal_stdlib>
+using namespace metal;
+struct fo2_fragment_Output { float4 oC0 [[color(0)]]; };
+fragment fo2_fragment_Output waterNormalTestPS(){
+  fo2_fragment_Output output;output.oC0=float4(.5,1,.5,1);return output;
+}
+)MSL";
 static Bytes bytecode(std::initializer_list<uint32_t> words) {
   Bytes b(words.size() * 4);
   std::memcpy(b.data(), words.begin(), b.size());
@@ -299,6 +308,13 @@ static void cpuChecks() {
       true, 1);
   require(color->source.find("input.v0.zyxw") != std::string::npos,
           "BGRA vertex input swizzle missing");
+  // Exercise this exact fixture transformation even without a Metal device;
+  // otherwise the opaque-output mismatch is discovered only in GPU preflight.
+  auto fixtureMetadata=waterLegacyZeroSource(waterNormalTestSource);
+  require(fixtureMetadata.find("float4 fo2legacy [[color(1)]];")!=std::string::npos&&
+          fixtureMetadata.find("output.fo2legacy=float4(.5,.5,.5,0);")!=std::string::npos,
+          "Water normal fixture does not support the metadata attachment");
+  std::puts("[Metal check] CPU water MRT: shared GPU normal fixture accepts zero metadata replay");
   std::puts("[Metal check] CPU: shader parsing, reflection, BGRA, constants "
             "and invalid input passed");
 }
@@ -462,7 +478,7 @@ static void checkPhysicalPuddleMask(Renderer& renderer){
     0x40000002,0x80180000,0x80ff0000,0x80ff0001,0xffff});
   for(bool terrain:{false,true}){
   auto original=translateShader(terrain?terrainBytecode():program,false,0,terrain?0:2);require(original->physicalWaterFamily==(terrain?2:1),"Physical puddle pixel program identity");
-  auto normal=std::make_shared<Shader>(*original);normal->source=physicalWaterNormalSource(original->source,terrain);normal->hash=shaderHash(normal->source.data(),normal->source.size());
+  auto normal=std::make_shared<Shader>(*original);normal->gpu.reset();normal->source=physicalWaterNormalSource(original->source,terrain);normal->hash=shaderHash(normal->source.data(),normal->source.size());
   Draw d;d.color=image();d.count=3;d.raster.depthOn=d.raster.depthWrite=false;d.raster.viewport[2]=d.raster.viewport[3]=16;
   d.vs=sourceShader(R"MSL(#include <metal_stdlib>
 using namespace metal;
@@ -477,7 +493,7 @@ vertex PuddleOut puddleVS(uint i [[vertex_id]]){return {float4(i==1?3.0:-1.0,i==
     d.ps=normal;renderer.clear(d.color,{},1,zero,1,0);renderer.draw(d);
     nearPixel(renderer.read(d.color),8,8,alpha?std::array<int,4>{128,255,128,int(alpha)}:std::array<int,4>{0,0,0,0},"Physical puddle normal/authored-alpha mask");
     if(!terrain){
-      auto replacement=std::make_shared<Shader>(*original);replacement->source=waterLegacyWindowSource(original->source);
+      auto replacement=std::make_shared<Shader>(*original);replacement->gpu.reset();replacement->source=waterLegacyWindowSource(original->source);
       replacement->hash=shaderHash(replacement->source.data(),replacement->source.size());
       d.ps=replacement;d.materialTarget=image();renderer.clear(d.materialTarget,{},1,zero,1,0);
       renderer.clear(d.color,{},1,zero,1,0);renderer.draw(d);
@@ -489,7 +505,7 @@ vertex PuddleOut puddleVS(uint i [[vertex_id]]){return {float4(i==1?3.0:-1.0,i==
         d.effects[3]=1;d.effects[4]=3;d.effects[5]=0;d.effects[6]=2;d.effects[8]=d.effects[9]=d.effects[10]=.2f;
         renderer.draw(d);nearPixel(renderer.read(d.materialTarget),8,8,{160,160,160,128},"Water replacement lost fog attenuation/direct light");d.effects[3]=0;
       }
-      auto reset=std::make_shared<Shader>(*normal);reset->source=waterLegacyZeroSource(normal->source);reset->hash=shaderHash(reset->source.data(),reset->source.size());
+      auto reset=std::make_shared<Shader>(*normal);reset->gpu.reset();reset->source=waterLegacyZeroSource(normal->source);reset->hash=shaderHash(reset->source.data(),reset->source.size());
       if(alpha){d.ps=reset;renderer.draw(d);nearPixel(renderer.read(d.materialTarget),8,8,{128,128,128,0},"Unsupported water did not invalidate old metadata");}
       d.materialTarget.reset();
     }
@@ -691,7 +707,7 @@ static void checkWater(Renderer& renderer,const Draw& fixture,bool stencil=false
   geometry({{-.75f,.25f,.4f,1},{-.25f,.25f,.4f,1},{-.75f,.75f,.4f,1},
             {-.25f,.25f,.4f,1},{-.25f,.75f,.4f,1},{-.75f,.75f,.4f,1}},{0,1,0,1});
   auto waterPS=std::make_shared<Shader>(*d.ps);waterPS->waterVariant=std::make_shared<Shader>();
-  waterPS->waterVariant->source="#include <metal_stdlib>\nusing namespace metal;fragment float4 waterNormalTestPS(){return float4(.5,1,.5,1);}";
+  waterPS->waterVariant->source=waterNormalTestSource;
   waterPS->waterVariant->entry="waterNormalTestPS";waterPS->waterVariant->hash=shaderHash(waterPS->waterVariant->source.data(),waterPS->waterVariant->source.size());
   d.ps=waterPS;d.material=worldWaterMaterial();d.waterBasisValid=true;d.waterBasis={1,0,0,0,1,0,0,0,1};
   d.raster.depthWrite=false;d.raster.blendOn=true;d.raster.src=Blend::One;d.raster.dst=Blend::InvSrcAlpha;
