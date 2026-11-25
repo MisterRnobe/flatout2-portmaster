@@ -152,13 +152,15 @@ fragment float4 ssrCompositePS(float4 pixel [[position]],texture2d<float> base [
                                texture2d<float> scene [[texture(1)]],texture2d<float> reflection [[texture(2)]],
                                texture2d<float> materials [[texture(3)]],texture2d<float> waterNormals [[texture(4)]],
                                texture2d<float> waterScene [[texture(5)]],depth2d<float,access::read> opaqueDepth [[texture(6)]],
-                               depth2d<float,access::read> waterDepth [[texture(7)]],texture2d<float> rtWater [[texture(8)]],constant float4* c [[buffer(0)]]){
+                               depth2d<float,access::read> waterDepth [[texture(7)]],texture2d<float> rtWater [[texture(8)]],
+                               texture2d<float> legacyWater [[texture(9)]],texture2d<float> authoredWater [[texture(10)]],constant float4* c [[buffer(0)]]){
     uint2 p=uint2(pixel.xy);float4 original=base.read(p);
     bool water=c[3].x>.5&&waterNormals.read(p).a>.001&&waterDepth.read(p)<=opaqueDepth.read(p)+2e-6;
     float4 hit=ssrResolve(p,reflection,materials,waterNormals,opaqueDepth,waterDepth,c);
+    bool tracedValid=false;
     if(water&&c[1].x>.5){
         float4 traced=ssrResolve(p,rtWater,materials,waterNormals,opaqueDepth,waterDepth,c);
-        if(traced.a>0)hit=traced;
+        if(traced.a>0){hit=traced;tracedValid=true;}
     }
     if(c[2].z>.5){
         if(water)return float4(0,.6,.8,1);
@@ -170,9 +172,34 @@ fragment float4 ssrCompositePS(float4 pixel [[position]],texture2d<float> base [
     float3 delta=abs(original.rgb-reference);
     float difference=max(max(delta.r,delta.g),delta.b);
     float gain=water&&isfinite(c[1].y)&&c[1].y>=1?clamp(c[1].y,1.0,8.0):1.0;
-    float weight=clamp(hit.a*gain,0.0,1.0)*(1-smoothstep(.08,.25,difference));
+    float overlay=1-smoothstep(.08,.25,difference);
+    float weight=clamp(hit.a*gain,0.0,1.0)*overlay;
     if(c[2].w>.5 && !water){float4 m=materials.read(p);if(m.r==0||abs(m.b*255-c[3].w)<.5)weight=0;}
-    return float4(mix(original.rgb,hit.rgb,weight),original.a);
+    float3 result=mix(original.rgb,hit.rgb,weight);
+    if(water&&tracedValid){
+        float4 legacy=legacyWater.read(p);
+        if(legacy.a>1.0/255.0){
+            float3 authored=authoredWater.read(p).rgb;
+            float3 neutral=clamp(authored-(legacy.rgb*2-1),0.0,1.0);
+            float3 position=debugPosition(p,waterDepth,c),normal=waterNormals.read(p).rgb*2-1;
+            float n2=dot(normal,normal),p2=dot(position,position);
+            if(isfinite(n2)&&n2>.25&&isfinite(p2)&&p2>1e-6){
+                normal*=rsqrt(n2);if(dot(normal,position)>0)normal=-normal;
+                float cosine=clamp(dot(-position*rsqrt(p2),normal),0.0,1.0);
+                float fresnel=c[3].y+(1-c[3].y)*pow(1-cosine,5.0);
+                float receiver=waterNormals.read(p).a*(1-.7*c[3].z)*(1-smoothstep(100.0,150.0,-position.z));
+                // RT alpha contains Fresnel/coverage and confidence. The
+                // original shader's authored cube blend already supplies its
+                // own reflectance, so retain only confidence here.
+                float confidence=clamp(hit.a/max(receiver*fresnel,1e-6),0.0,1.0);
+                float3 change=abs(reference-authored);
+                float agreement=1-smoothstep(.08,.25,max(max(change.r,change.g),change.b));
+                float3 desired=clamp(neutral+hit.rgb*legacy.a,0.0,1.0);
+                result=mix(result,original.rgb+desired-authored,confidence*agreement*overlay);
+            }
+        }
+    }
+    return float4(result,original.a);
 }
 )MSL";
 }

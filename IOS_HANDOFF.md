@@ -71,3 +71,7 @@ Native CPU tests under `tests/` include geometry/caching/ownership, car-material
 ## Suggested first message to the iOS agent
 
 > Read IOS_HANDOFF.md and MACOS.md. Work only in this iOS clone on ios-port. Create and build a real iOS target using the existing statically recompiled guest and native Metal renderer. First prove guest memory reservation and runtime/renderer fixtures on the target iPhone, then reach the menu and a single race with SSR/RT initially off. Keep iOS host/build changes separate from shared renderer/runtime fixes so later macos-metal commits can be rebased. Do not modify the sibling macOS project or upload private game/generated/save data.
+
+### Verified puddle reflection replacement follow-up
+
+The macOS race test now opts into `FO2_WATER_REPLACE_REFLECTION=1` with unit diagnostic gain. New `runtime/render/water_replacement.h` generates private MRT variants only for the inspected opaque non-sRGB cube-window water family; other families retain the old path. `renderer.mm` stores one additional RGBA8 image per water layer, clears/invalidate metadata, and binds compositor textures 9 (signed authored contribution/coverage) and 10 (water-pass color). Keep the updated compositor sampler mask (2047) and `ssr.h` texture signature together when rebasing. No guest ABI or game asset change is required. The frozen iOS checkpoint/branch is unchanged. GPU fixtures were extended; hardware acceptance must run on the destination device. This is not general sRGB, blended-water or arbitrary-postprocessing replacement.

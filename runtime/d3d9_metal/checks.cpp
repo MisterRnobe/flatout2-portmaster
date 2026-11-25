@@ -5,12 +5,14 @@
 #include "../render/material_shader.h"
 #include "../render/water.h"
 #include "../render/physical_water.h"
+#include "../render/water_replacement.h"
 #include "../render/terrain_specular.h"
 #include "debug_views.h"
 #include "ssr.h"
 #include "trace_car_fixture.h"
 #include <algorithm>
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -344,8 +346,18 @@ int checkMetalShaders(const char *directory, bool gpu) {
             water->hash=shaderHash(water->source.data(),water->source.size());if(renderer)renderer->validateShader(water);
           }
           if(shaderHash(bytes.data(),bytes.size())==0xb20adcd636eb7f43ull){
+            bool rejected=false;try{waterLegacyWindowSource(shader->source);}catch(const std::exception&){rejected=true;}
+            require(rejected,"Water replacement accepted a 2D environment sampler");
             auto physical=translateShader(bytes,false,0,2);require(physical->physicalWaterFamily,"Physical water program identity");
-            physical->source=physicalWaterNormalSource(physical->source);physical->hash=shaderHash(physical->source.data(),physical->source.size());
+            auto replacement=std::make_shared<Shader>(*physical);replacement->source=waterLegacyWindowSource(physical->source);
+            replacement->hash=shaderHash(replacement->source.data(),replacement->source.size());
+            std::ofstream(output/"water-replacement.metal")<<replacement->source;
+            require(replacement->source.find("r0.xyz *= 1.0-fo2coverage")!=std::string::npos&&
+                    replacement->source.find("fo2coverage*=clamp(factor,0.0,1.0)")!=std::string::npos,"Water replacement lost authored base/fog attenuation");
+            rejected=false;try{waterLegacyWindowSource(replacement->source);}catch(const std::exception&){rejected=true;}
+            require(rejected,"Water replacement accepted duplicate metadata attachment");
+            if(renderer)renderer->validateShader(replacement);
+            physical->source=waterLegacyZeroSource(physicalWaterNormalSource(physical->source));physical->hash=shaderHash(physical->source.data(),physical->source.size());
             if(renderer)renderer->validateShader(physical);
           }
           if(shader->terrainSpecularMask){
@@ -455,7 +467,7 @@ static void checkPhysicalPuddleMask(Renderer& renderer){
   d.vs=sourceShader(R"MSL(#include <metal_stdlib>
 using namespace metal;
 struct PuddleOut{float4 position [[position]];float4 uv [[user(texcoord0)]];float4 reflection [[user(texcoord1)]];float4 diffuse [[user(color0)]];float4 specular [[user(color1)]];};
-vertex PuddleOut puddleVS(uint i [[vertex_id]]){return {float4(i==1?3.0:-1.0,i==2?3.0:-1.0,0,1),float4(.5),float4(1,0,0,1),float4(1),float4(0)};}
+vertex PuddleOut puddleVS(uint i [[vertex_id]]){return {float4(i==1?3.0:-1.0,i==2?3.0:-1.0,0,1),float4(.5),float4(1,0,0,1),float4(1),float4(.1)};}
 )MSL","puddleVS",true);
   d.textures[0]=image(1,1);d.textures[1]=image(1,1);d.textures[1]->faces=terrain?1:6;d.textures[1]->rgba.assign(terrain?1:6,Bytes{128,128,128,255});
   d.effects[48]=0;d.effects[49]=1;d.effects[50]=0;float zero[4]{};
@@ -464,6 +476,23 @@ vertex PuddleOut puddleVS(uint i [[vertex_id]]){return {float4(i==1?3.0:-1.0,i==
     d.ps=original;renderer.clear(d.color,{},1,zero,1,0);renderer.draw(d);auto colorBefore=renderer.read(d.color);
     d.ps=normal;renderer.clear(d.color,{},1,zero,1,0);renderer.draw(d);
     nearPixel(renderer.read(d.color),8,8,alpha?std::array<int,4>{128,255,128,int(alpha)}:std::array<int,4>{0,0,0,0},"Physical puddle normal/authored-alpha mask");
+    if(!terrain){
+      auto replacement=std::make_shared<Shader>(*original);replacement->source=waterLegacyWindowSource(original->source);
+      replacement->hash=shaderHash(replacement->source.data(),replacement->source.size());
+      d.ps=replacement;d.materialTarget=image();renderer.clear(d.materialTarget,{},1,zero,1,0);
+      renderer.clear(d.color,{},1,zero,1,0);renderer.draw(d);
+      // Base is 1.0; the old cube is 128/255. Removing just the cube
+      // retains base*(1-alpha), not the unattenuated base.
+      int encoded=int(std::lround((128.0/255*alpha/255*.5+.5)*255));
+      nearPixel(renderer.read(d.materialTarget),8,8,alpha?std::array<int,4>{encoded,encoded,encoded,int(alpha)}:std::array<int,4>{0,0,0,0},"Water authored environment delta/coverage");
+      if(alpha==255){
+        d.effects[3]=1;d.effects[4]=3;d.effects[5]=0;d.effects[6]=2;d.effects[8]=d.effects[9]=d.effects[10]=.2f;
+        renderer.draw(d);nearPixel(renderer.read(d.materialTarget),8,8,{160,160,160,128},"Water replacement lost fog attenuation/direct light");d.effects[3]=0;
+      }
+      auto reset=std::make_shared<Shader>(*normal);reset->source=waterLegacyZeroSource(normal->source);reset->hash=shaderHash(reset->source.data(),reset->source.size());
+      if(alpha){d.ps=reset;renderer.draw(d);nearPixel(renderer.read(d.materialTarget),8,8,{128,128,128,0},"Unsupported water did not invalidate old metadata");}
+      d.materialTarget.reset();
+    }
     d.ps=original;renderer.clear(d.color,{},1,zero,1,0);renderer.draw(d);
     require(renderer.read(d.color)==colorBefore,"Private puddle mask changed original shader output");
   }
@@ -472,15 +501,15 @@ vertex PuddleOut puddleVS(uint i [[vertex_id]]){return {float4(i==1?3.0:-1.0,i==
 }
 static void checkHybridWaterComposite(Renderer& renderer,const Draw& fixture){
   Draw d=fixture;d.color=image();d.depth.reset();d.debugProjection={};d.raster.depthOn=d.raster.depthWrite=false;
-  d.ps=sourceShader(std::string(debugViewSource)+ssrSource,"ssrCompositePS");d.ps->samplerMask=511;
+  d.ps=sourceShader(std::string(debugViewSource)+ssrSource,"ssrCompositePS");d.ps->samplerMask=2047;
   auto base=image(),scene=image(),materials=image(),normals=image(),ssr=image(8,8),rt=image(4,4);
-  auto opaque=image(16,16,true),water=image(16,16,true);
+  auto opaque=image(16,16,true),water=image(16,16,true),legacy=image(),authored=image();
   auto solid=[](const std::shared_ptr<Image>& image,std::array<uint8_t,4> rgba){
     for(size_t i=0;i<image->rgba[0].size();i+=4)std::copy(rgba.begin(),rgba.end(),image->rgba[0].begin()+i);++image->version;};
   solid(base,{0,0,255,255});solid(scene,{0,0,255,255});solid(normals,{128,128,255,255});
   solid(ssr,{0,255,0,128});solid(rt,{255,0,0,128});
   d.textures[0]=base;d.textures[1]=scene;d.textures[2]=ssr;d.textures[3]=materials;d.textures[4]=normals;
-  d.textures[5]=scene;d.textures[6]=opaque;d.textures[7]=water;d.textures[8]=rt;
+  d.textures[5]=scene;d.textures[6]=opaque;d.textures[7]=water;d.textures[8]=rt;d.textures[9]=legacy;d.textures[10]=authored;
   float c[16]={1,1,1.01f,-.1f,0,0,0,0,8,8,0,1,1,.04f,.1f,3};float zero[4]{};
   renderer.clear({},opaque,2,zero,.8f,0);renderer.clear({},water,2,zero,.5f,0);
   auto render=[&]{d.psConstants.resize(sizeof c);std::memcpy(d.psConstants.data(),c,sizeof c);renderer.draw(d);return renderer.read(d.color);};
@@ -493,6 +522,17 @@ static void checkHybridWaterComposite(Renderer& renderer,const Draw& fixture){
   solid(rt,{255,0,0,0});nearPixel(render(),8,8,{0,128,127,255},"Water RT miss lost SSR fallback");
   c[5]=4;solid(rt,{255,0,0,128});solid(base,{255,255,0,255});nearPixel(render(),8,8,{255,255,0,255},"Water RT overwrote HUD");
   solid(base,{0,0,255,255});solid(normals,{128,128,255,0});nearPixel(render(),8,8,{0,0,255,255},"Water RT leaked onto nonwater");
+  // Original authored color = retained base/direct light + old environment.
+  // Replace only the environment contribution, without a second Fresnel blend.
+  c[5]=1;solid(normals,{128,128,255,255});solid(base,{128,128,128,255});solid(scene,{128,128,128,255});
+  solid(authored,{128,128,128,255});solid(legacy,{160,160,160,128});solid(rt,{255,0,0,128});
+  nearPixel(render(),8,8,{191,63,63,255},"Authored water environment was not replaced exactly once");
+  solid(rt,{255,0,0,0});solid(ssr,{0,255,0,0});nearPixel(render(),8,8,{128,128,128,255},"Replacement removed original environment on an RT miss");
+  solid(rt,{255,0,0,128});solid(base,{255,255,0,255});nearPixel(render(),8,8,{255,255,0,255},"Replacement overwrote a HUD overlay");
+  solid(base,{128,128,128,255});solid(authored,{0,0,0,255});
+  nearPixel(render(),8,8,{192,64,64,255},"Replacement ignored authored/late-scene mismatch");
+  solid(authored,{128,128,128,255});solid(normals,{128,128,255,0});
+  nearPixel(render(),8,8,{128,128,128,255},"Replacement leaked onto nonwater");
   d.color=image(4,4);d.raster.viewport[2]=d.raster.viewport[3]=4;
   d.ps=sourceShader(std::string(debugViewSource)+ssrSource,"reflectionCopyPS");d.ps->samplerMask=1;d.textures[0]=rt;
   renderer.draw(d);auto copied=renderer.read(d.color);

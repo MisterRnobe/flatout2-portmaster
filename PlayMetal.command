@@ -49,6 +49,7 @@ printf 'profile=%s\nbinary=%s\napi_validation=%s\nshader_validation=%s\nparticle
     "${FO2_TEST_SCENARIO:-manual}" "${FO2_DEBUG_VIEW:-off}" > "$FO2_METAL_SESSION_DIR/run-info.txt"
 printf 'test_level=%s\n' "${FO2_TEST_LEVEL:-default}" >> "$FO2_METAL_SESSION_DIR/run-info.txt"
 printf 'ssr_materials=%s\n' "${FO2_SSR_MATERIALS:-1}" >> "$FO2_METAL_SESSION_DIR/run-info.txt"
+printf 'water_legacy_replacement=%s\n' "${FO2_WATER_REPLACE_REFLECTION:-0}" >> "$FO2_METAL_SESSION_DIR/run-info.txt"
 printf 'water_reflection_gain=%s\n' "${FO2_WATER_REFLECTION_GAIN:-1}" >> "$FO2_METAL_SESSION_DIR/run-info.txt"
 printf 'rt_geometry_capture=%s\n' "${FO2_RT_GEOMETRY_CAPTURE:-0}" >> "$FO2_METAL_SESSION_DIR/run-info.txt"
 printf 'rt_live_diagnostic=%s\n' "${FO2_RT_LIVE_DIAGNOSTIC:-0}" >> "$FO2_METAL_SESSION_DIR/run-info.txt"

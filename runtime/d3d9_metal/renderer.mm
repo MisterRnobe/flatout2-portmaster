@@ -9,6 +9,7 @@
 #include "ssr.h"
 #include "../render/material_shader.h"
 #include "../render/water.h"
+#include "../render/water_replacement.h"
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -229,8 +230,17 @@ struct Renderer::Impl {
   bool lateSceneReady=false;
   std::unordered_map<std::string,std::shared_ptr<Shader>> materialShaders;
   std::array<uint64_t,5> materialDraws{};
-  struct WaterLayer {bool active=false;std::shared_ptr<Image> sourceColor,sourceDepth,normals,depth,color;};
+  struct WaterLayer {bool active=false;std::shared_ptr<Image> sourceColor,sourceDepth,normals,depth,color,legacy;};
   std::array<WaterLayer,4> waterLayers;
+  std::unordered_map<std::string,std::shared_ptr<Shader>> legacyWaterShaders;
+  std::shared_ptr<Shader> legacyWaterShader(const std::shared_ptr<Shader>& original,bool replacement){
+    auto key=pipelineShaderIdentity(*original)+(replacement?":replace-water":":zero-water");
+    auto found=legacyWaterShaders.find(key);if(found!=legacyWaterShaders.end())return found->second;
+    if(legacyWaterShaders.size()>=32)throw std::runtime_error("Water replacement shader budget exceeded");
+    auto shader=std::make_shared<Shader>(*original);shader->gpu.reset();shader->materialVariant.reset();shader->waterVariant.reset();
+    shader->source=replacement?waterLegacyWindowSource(original->source):waterLegacyZeroSource(original->source);
+    shader->hash=shaderHash(shader->source.data(),shader->source.size());return legacyWaterShaders.emplace(key,shader).first->second;
+  }
   std::shared_ptr<Image> selectedColorSource,selectedDepthSource;
   uint64_t waterDraws=0,waterDropped=0;
   std::shared_ptr<Shader> materialShader(const std::shared_ptr<Shader>& original){
@@ -1043,6 +1053,10 @@ void Renderer::draw(const Draw &input) {
         if(!layer.normals||layer.normals->width!=impl->width||layer.normals->height!=impl->height){layer.normals=impl->colorImage();layer.color=impl->colorImage();layer.depth.reset();}
         if(!layer.depth||layer.depth->stencil!=input.depth->stencil){layer.depth=std::make_shared<Image>();layer.depth->width=impl->width;layer.depth->height=impl->height;layer.depth->depth=true;layer.depth->stencil=input.depth->stencil;}
         float zero[4]{};clear(layer.normals,{},1,zero,1,0);
+        if(waterReplacementEnabled()){
+          if(!layer.legacy||layer.legacy->width!=impl->width||layer.legacy->height!=impl->height)layer.legacy=impl->colorImage();
+          clear(layer.legacy,{},1,zero,1,0);
+        }
         impl->endPass();impl->begin();auto blit=[impl->command blitCommandEncoder];
         [blit copyFromTexture:impl->image(input.depth) sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
                   sourceSize:MTLSizeMake(impl->width,impl->height,1) toTexture:impl->image(layer.depth)
@@ -1058,6 +1072,10 @@ void Renderer::draw(const Draw &input) {
         surface.ps=input.ps->waterVariant;
       }else surface.ps=input.ps->waterVariant;
       surface.colorSrgb=false;surface.materialTarget.reset();surface.captureMaterial=false;surface.waterBasisValid=false;surface.debugProjection={};surface.material={};
+      if(waterReplacementEnabled()&&layer.legacy){
+        bool replace=physical&&input.ps->physicalWaterFamily==1&&!input.raster.blendOn&&!input.effects[0]&&!input.raster.fill&&!input.colorSrgb;
+        surface.ps=impl->legacyWaterShader(replace?input.ps:surface.ps,replace);surface.materialTarget=layer.legacy;
+      }
       surface.raster.depthWrite=true;if(physical)surface.raster.depthCompare=Compare::LessEqual;surface.raster.blendOn=false;surface.raster.colorMask=15;surface.raster.stencilOn=false;
       if(physical)std::copy(physicalNormal.begin(),physicalNormal.end(),surface.effects.begin()+48);
       else std::copy(input.waterBasis.begin(),input.waterBasis.end(),surface.effects.begin()+48);draw(surface);
@@ -1268,7 +1286,7 @@ std::shared_ptr<Image> Renderer::screenReflections(const std::shared_ptr<Image>&
     auto source=std::string(debugViewSource)+ssrSource;
     auto shader=[&](const char* entry,bool vertex,uint32_t samplers){auto s=std::make_shared<Shader>();s->source=source;s->hash=shaderHash(source.data(),source.size());s->entry=entry;s->vertex=vertex;s->samplerMask=samplers;return s;};
     // Use a separate VS because the debug-view library may not yet exist.
-    impl->ssrPS=shader("ssrPS",false,31);impl->ssrCompositePS=shader("ssrCompositePS",false,511);
+    impl->ssrPS=shader("ssrPS",false,31);impl->ssrCompositePS=shader("ssrCompositePS",false,2047);
     if(!impl->debugVS)impl->debugVS=shader("debugVS",true,0);
   }
   float constants[16]{};std::copy(impl->selectedProjection.values.begin(),impl->selectedProjection.values.end(),constants);
@@ -1300,7 +1318,7 @@ std::shared_ptr<Image> Renderer::screenReflections(const std::shared_ptr<Image>&
   }catch(const std::exception& e){impl->rtWaterOn=false;waterTraceState=3;impl->waterTraceScene.disable();impl->waterTrace.reset();
     std::fprintf(stderr,"[FO2 RT WATER] Disabled: %s; continuing with SSR\n",e.what());}
   impl->currentWaterTrace=rtWater;impl->currentWaterTraceFrame=impl->frames;
-  constants[4]=rtWater?1:0;std::memcpy(d.psConstants.data(),constants,sizeof constants);d.textures[8]=rtWater;
+  constants[4]=rtWater?1:0;std::memcpy(d.psConstants.data(),constants,sizeof constants);d.textures[8]=rtWater;d.textures[9]=waterReplacementEnabled()&&water?water->legacy:nullptr;d.textures[10]=water?water->color:nullptr;
   d.color=impl->debugOutput;d.ps=impl->ssrCompositePS;d.raster.viewport[2]=impl->width;d.raster.viewport[3]=impl->height;
   d.textures[0]=base;d.textures[1]=impl->lateSceneReady?impl->lateScene:impl->debugScene;d.textures[2]=impl->ssrHalf;d.textures[3]=impl->materialSaved;d.textures[4]=water?water->normals:nullptr;d.textures[5]=impl->lateSceneReady?impl->lateScene:(water?water->color:impl->debugScene);d.textures[6]=impl->debugDepth;d.textures[7]=water?water->depth:impl->debugDepth;draw(d);
   if(impl->frames%300==0){
@@ -1393,6 +1411,11 @@ fragment float4 inspectionDepthPS(float4 p [[position]],depth2d<float,access::re
 
     if(impl->lateSceneReady)save("pre-hud-scene.ppm",read(impl->lateScene),impl->width,impl->height);
     if(water)save("water-pass-scene.ppm",read(water->color),impl->width,impl->height);
+    uint64_t replacementPixels=0;
+    if(waterReplacementEnabled()&&water&&water->legacy){auto metadata=read(water->legacy);
+      save("water-legacy-delta.ppm",metadata,impl->width,impl->height);
+      for(size_t i=3;i<metadata.size();i+=4)if(metadata[i]>1)++replacementPixels;
+    }
     Bytes strength=reflections;uint64_t receiverPixels=0,waterPixels=0,hitPixels=0,waterHitPixels=0;
     auto isWater=[&](size_t i){return receivers[i]==0&&receivers[i+1]==153&&receivers[i+2]==204;};
     for(size_t i=0;i<receivers.size();i+=4){if(isWater(i))++waterPixels;if(receivers[i]||receivers[i+1]||receivers[i+2])++receiverPixels;}
@@ -1428,7 +1451,7 @@ fragment float4 inspectionDepthPS(float4 p [[position]],depth2d<float,access::re
       save("difference-x8.ppm",difference,impl->width,impl->height);
       if(rtCompared){
         c[4]=1;d.psConstants.resize(sizeof c);std::memcpy(d.psConstants.data(),c,sizeof c);
-        d.textures[8]=impl->currentWaterTrace;draw(d);auto hybrid=read(composite),rtDifference=after;
+        d.textures[8]=impl->currentWaterTrace;d.textures[9]=waterReplacementEnabled()&&water?water->legacy:nullptr;d.textures[10]=water?water->color:nullptr;draw(d);auto hybrid=read(composite),rtDifference=after;
         for(size_t i=0;i<after.size();i+=4){unsigned maximum=0;
           for(unsigned k=0;k<3;++k){unsigned delta=unsigned(std::abs(int(after[i+k])-int(hybrid[i+k])));
             maximum=std::max(maximum,delta);rtDifference[i+k]=uint8_t(std::min(255u,delta*8));}
@@ -1459,6 +1482,7 @@ fragment float4 inspectionDepthPS(float4 p [[position]],depth2d<float,access::re
       @"opaque_fixed_specular_pixels":@(cues[2]),@"opaque_water_cue_pixels":@(cues[3]),@"opaque_terrain_specular_pixels":@(cues[4]),
       @"rt_same_frame_compared":@(rtCompared),@"rt_source_frame":@(impl->currentWaterTraceFrame),
       @"water_reflection_gain":@(waterReflectionGain()),
+      @"water_legacy_replacement_enabled":@(waterReplacementEnabled()),@"water_legacy_replacement_pixels":@(replacementPixels),
       @"rt_near_visible_material_hits":@(rtCompared&&impl->waterTrace?impl->waterTrace->nearVisibleMaterialHitCount():0),
       @"rt_ray_only_material_hits":@(rtCompared&&impl->waterTrace?impl->waterTrace->rayOnlyMaterialHitCount():0),
       @"rt_detached_material_hits":@(rtCompared&&impl->waterTrace?impl->waterTrace->detachedMaterialHitCount():0),

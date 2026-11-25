@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class RTSceneLauncherTest(unittest.TestCase):
-    def launch(self, args=(), result=0, snapshot=True, water_result=0, dedicated=False, gain=None):
+    def launch(self, args=(), result=0, snapshot=True, water_result=0, dedicated=False, gain=None, replacement=None):
         with tempfile.TemporaryDirectory(prefix='fo2-rt-launcher-') as temp:
             root = Path(temp)
             for name in ['TestMetalWater.command', 'TestMetal.command', 'TestMetalRTRace.command']:
@@ -43,6 +43,7 @@ echo "$1" >> "$FO2_FAKE_LOG"
             play = root/'PlayMetal.command'
             play.write_text('#!/bin/bash\necho "play:$FO2_TEST_SCENARIO:$FO2_DEBUG_VIEW" >> "$FO2_FAKE_LOG"\necho "live:$FO2_RT_LIVE_DIAGNOSTIC" >> "$FO2_FAKE_LOG"\necho "water:$FO2_RT_WATER" >> "$FO2_FAKE_LOG"\n'
                             'echo "level:${FO2_TEST_LEVEL:-manual}" >> "$FO2_FAKE_LOG"\n'
+                            'echo "replacement:${FO2_WATER_REPLACE_REFLECTION:-0}" >> "$FO2_FAKE_LOG"\n'
                             'echo "gain:${FO2_WATER_REFLECTION_GAIN:-1}" >> "$FO2_FAKE_LOG"\n'
                             'if [[ "$FO2_TEST_SCENARIO" == auto-race ]]; then\n'
                             '  [[ "$FO2_GAME_DIR" -ef "$FO2_METAL_SESSION_DIR/gamedata" ]] || exit 9\n'
@@ -55,6 +56,8 @@ echo "$1" >> "$FO2_FAKE_LOG"
             env = dict(os.environ, FO2_FAKE_LOG=str(root/'calls'), FO2_FAKE_RT_RESULT=str(result), FO2_FAKE_WATER_RESULT=str(water_result), FO2_WATER_PHYSICS_TRACE='0')
             for name in ['FO2_RT_SCENE_DIR', 'FO2_METAL_SESSION_DIR', 'FO2_MEMORY_CHECK']:
                 env.pop(name, None)
+            if replacement is None: env.pop('FO2_WATER_REPLACE_REFLECTION', None)
+            else: env['FO2_WATER_REPLACE_REFLECTION'] = str(replacement)
             if gain is None: env.pop('FO2_WATER_REFLECTION_GAIN', None)
             else: env['FO2_WATER_REFLECTION_GAIN'] = str(gain)
             run = subprocess.run(['bash', str(root/('TestMetalRTRace.command' if dedicated else 'TestMetalWater.command')), *args], env=env,
@@ -70,16 +73,23 @@ echo "$1" >> "$FO2_FAKE_LOG"
         self.assertIn('play:auto-race:ssr', calls)
         self.assertIn('level:water-derby', calls)
         self.assertIn('water:1', calls)
-        self.assertIn('gain:4', calls)
+        self.assertIn('gain:1', calls)
+        self.assertIn('replacement:1', calls)
         self.assertIn('--metal-check-raytracing-water', calls)
 
-    def test_dedicated_race_can_restore_unit_gain(self):
-        run, calls = self.launch(dedicated=True, gain=1)
+    def test_dedicated_race_allows_explicit_diagnostic_gain(self):
+        run, calls = self.launch(dedicated=True, gain=4)
         self.assertEqual(run.returncode, 0, run.stdout+run.stderr)
-        self.assertIn('gain:1', calls)
+        self.assertIn('gain:4', calls)
         run, calls = self.launch()
         self.assertEqual(run.returncode, 0, run.stdout+run.stderr)
         self.assertIn('gain:1', calls)
+
+    def test_replacement_opt_out_and_manual_default(self):
+        for dedicated in (False, True):
+            run, calls = self.launch(dedicated=dedicated, replacement=0 if dedicated else None)
+            self.assertEqual(run.returncode, 0, run.stdout+run.stderr)
+            self.assertIn('replacement:0', calls)
 
     def test_automatic_race_preserves_mask_and_rt_fallback(self):
         run, calls = self.launch(('--auto-race', '--rt-water', '--mask'), water_result=77)
